@@ -15,6 +15,11 @@ from urllib.parse import urlparse
 
 import dns.resolver
 import requests
+import urllib3
+
+# Suppress SSL warnings when certificate verification is disabled
+# This is expected behavior for this tool - see Security Notes in README
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging for security events
 logger = logging.getLogger(__name__)
@@ -38,7 +43,9 @@ class SecureTLSAdapter(requests.adapters.HTTPAdapter):
         
         Args:
             verify_certificates: Whether to verify SSL certificates (default: True)
-            allow_legacy_tls: Whether to allow TLS 1.0/1.1 for legacy servers (default: False)
+            allow_legacy_tls: Whether to use relaxed cipher settings (SECLEVEL=1) for 
+                compatibility with older servers (default: False). Note: TLS 1.2 is
+                always the minimum version regardless of this setting.
         """
         self.verify_certificates = verify_certificates
         self.allow_legacy_tls = allow_legacy_tls
@@ -59,7 +66,8 @@ class SecureTLSAdapter(requests.adapters.HTTPAdapter):
             ctx.verify_mode = ssl.CERT_NONE
         
         if self.allow_legacy_tls:
-            logger.warning("Legacy TLS mode enabled - using relaxed cipher settings")
+            # SECLEVEL=1 allows older ciphers for compatibility with legacy servers
+            # TLS 1.2 remains the minimum version for security
             ctx.set_ciphers('DEFAULT@SECLEVEL=1')
         
         kwargs['ssl_context'] = ctx
