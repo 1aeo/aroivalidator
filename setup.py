@@ -33,24 +33,22 @@ font = "sans serif"
     print("✓ Created Streamlit configuration with 1AEO theme")
 
 def install_dependencies():
-    """Install required Python packages"""
-    dependencies = [
-        "streamlit",
-        "dnspython", 
-        "pandas",
-        "requests",
-        "urllib3"
-    ]
-    
-    print("Installing dependencies...")
+    """Install required Python packages from pyproject.toml"""
+    print("Installing dependencies from pyproject.toml...")
     try:
-        # Try uv (Replit's package manager)
-        subprocess.run(["uv", "add"] + dependencies, check=True, capture_output=True)
-        print("✓ Installed dependencies")
+        # Try uv (Replit's package manager) - reads from pyproject.toml
+        subprocess.run(["uv", "sync"], check=True, capture_output=True)
+        print("✓ Installed dependencies with uv")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # Fallback to pip
-        subprocess.run([sys.executable, "-m", "pip", "install"] + dependencies, check=True)
-        print("✓ Installed dependencies")
+        # Fallback to pip with pyproject.toml
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "."], check=True)
+            print("✓ Installed dependencies with pip")
+        except subprocess.CalledProcessError:
+            # Last resort: install core dependencies directly
+            core_deps = ["streamlit", "dnspython", "pandas", "requests", "urllib3"]
+            subprocess.run([sys.executable, "-m", "pip", "install"] + core_deps, check=True)
+            print("✓ Installed core dependencies")
 
 def main():
     """Main setup function"""

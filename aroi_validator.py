@@ -172,30 +172,21 @@ class ParallelAROIValidator:
         despite documentation stating only relays from the past week are included.
         """
         cutoff_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=14)
-        active_relays = []
-        
-        for relay in relays:
-            # If relay is running, include it
-            if relay.get('running', False):
-                active_relays.append(relay)
-                continue
-            
-            # If relay is not running, check last_seen
-            last_seen_str = relay.get('last_seen')
-            if last_seen_str:
-                try:
-                    # Parse timestamp: "2025-11-22 16:00:00"
-                    last_seen = datetime.strptime(last_seen_str, '%Y-%m-%d %H:%M:%S')
-                    
-                    # Include relay if it was seen within the last 14 days
-                    if last_seen >= cutoff_date:
-                        active_relays.append(relay)
-                except ValueError:
-                    # If we can't parse the timestamp, exclude it for safety
-                    continue
-            # If no last_seen field, exclude the relay
-        
-        return active_relays
+        return [
+            relay for relay in relays
+            if relay.get('running', False) or self._is_recently_seen(relay, cutoff_date)
+        ]
+    
+    def _is_recently_seen(self, relay: Dict[str, Any], cutoff_date: datetime) -> bool:
+        """Check if a non-running relay was seen within the cutoff period."""
+        last_seen_str = relay.get('last_seen')
+        if not last_seen_str:
+            return False
+        try:
+            last_seen = datetime.strptime(last_seen_str, '%Y-%m-%d %H:%M:%S')
+            return last_seen >= cutoff_date
+        except ValueError:
+            return False
     
     def validate_relay(self, relay: Dict[str, Any]) -> Dict[str, Any]:
         """Validate a single relay's AROI proof"""
@@ -511,80 +502,59 @@ class ParallelAROIValidator:
         """
         Categorize SSL errors and return detailed, actionable error messages.
         
-        Args:
-            error_str: The SSL error string
-            url: The URL that failed
-            attempt: Current attempt number
-            max_attempts: Total number of attempts made
-            
-        Returns:
-            A detailed error message with diagnostic information
+        Uses a table-driven approach for maintainability and readability.
         """
         parsed = urlparse(url)
         hostname = parsed.netloc
         error_lower = error_str.lower()
         
         # Lazy certificate info lookup - only fetch when needed
-        cert_info = None
+        cert_info_cache = {}
         def get_cert_info():
-            nonlocal cert_info
-            if cert_info is None:
-                cert_info = self._get_ssl_cert_info(hostname)
-            return cert_info
+            if 'data' not in cert_info_cache:
+                cert_info_cache['data'] = self._get_ssl_cert_info(hostname)
+            return cert_info_cache['data']
         
-        # Connection timeout - no cert info needed
-        if 'timed out' in error_lower or 'timeout' in error_lower:
-            return f"Connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url} (attempt {attempt}/{max_attempts})"
+        # Table-driven error pattern matching: (patterns, needs_cert, template_func)
+        # Each entry: (list of patterns to match, whether cert info needed, message formatter)
+        error_patterns = [
+            # Connection errors (no cert info needed)
+            (['timed out', 'timeout'], False,
+             lambda: f"Connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url} (attempt {attempt}/{max_attempts})"),
+            (['connection refused'], False,
+             lambda: f"Connection refused for URL: {url} (attempt {attempt}/{max_attempts})"),
+            (['connection reset'], False,
+             lambda: f"Connection reset for URL: {url} (attempt {attempt}/{max_attempts})"),
+            (['certificate verify failed'], False,
+             lambda: f"SSL certificate verification failed for URL: {url}"),
+            
+            # Certificate errors (need cert info)
+            (['certificate has expired', 'cert_has_expired'], True,
+             lambda: f"SSL certificate expired on {get_cert_info().get('expiration', 'unknown date')} for URL: {url}"),
+            (['self signed certificate in certificate chain'], True,
+             lambda: f"SSL certificate chain contains self-signed certificate (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for URL: {url}"),
+            (['self signed certificate', 'self_signed_cert'], True,
+             lambda: f"SSL certificate is self-signed (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for URL: {url} - use a trusted CA like Let's Encrypt"),
+            (['unable to get local issuer'], True,
+             lambda: f"SSL certificate chain incomplete for URL: {url} - missing intermediate certificate for issuer: {get_cert_info().get('issuer_name', 'unknown')}"),
+            (['unknown ca', 'unable to get issuer'], True,
+             lambda: f"SSL certificate from unknown CA \"{get_cert_info().get('issuer_name', 'unknown')}\" for URL: {url} - use a trusted CA like Let's Encrypt"),
+            (['handshake failure', 'handshake_failure'], True,
+             lambda: f"TLS handshake failed for URL: {url} - server offered {get_cert_info().get('tls_version', 'unknown version')}, minimum required is TLS 1.2"),
+        ]
         
-        # Connection refused - no cert info needed
-        if 'connection refused' in error_lower:
-            return f"Connection refused for URL: {url} (attempt {attempt}/{max_attempts})"
-        
-        # Connection reset - no cert info needed
-        if 'connection reset' in error_lower:
-            return f"Connection reset for URL: {url} (attempt {attempt}/{max_attempts})"
-        
-        # Certificate verify failed (general) - no cert info needed
-        if 'certificate verify failed' in error_lower:
-            return f"SSL certificate verification failed for URL: {url}"
-        
-        # Certificate expired - needs cert info for expiration date
-        if 'certificate has expired' in error_lower or 'cert_has_expired' in error_lower:
-            exp_date = get_cert_info().get('expiration', 'unknown date')
-            return f"SSL certificate expired on {exp_date} for URL: {url}"
-        
-        # Hostname mismatch - needs cert info for hostnames
+        # Special case: hostname mismatch (requires compound check)
         if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
             cert_hosts = get_cert_info().get('hostnames', ['unknown'])
             cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
             return f"SSL hostname mismatch: certificate valid for {cert_hosts_str} but URL hostname is {hostname}"
         
-        # Self-signed certificate in chain - needs cert info for issuer
-        if 'self signed certificate in certificate chain' in error_lower:
-            issuer = get_cert_info().get('issuer_name', 'unknown issuer')
-            return f"SSL certificate chain contains self-signed certificate (issuer: {issuer}) for URL: {url}"
+        # Match against pattern table
+        for patterns, _, template_func in error_patterns:
+            if any(p in error_lower for p in patterns):
+                return template_func()
         
-        # Self-signed certificate - needs cert info for issuer
-        if 'self signed certificate' in error_lower or 'self_signed_cert' in error_lower:
-            issuer = get_cert_info().get('issuer_name', 'unknown issuer')
-            return f"SSL certificate is self-signed (issuer: {issuer}) for URL: {url} - use a trusted CA like Let's Encrypt"
-        
-        # Incomplete chain - needs cert info for issuer
-        if 'unable to get local issuer' in error_lower:
-            issuer = get_cert_info().get('issuer_name', 'unknown')
-            return f"SSL certificate chain incomplete for URL: {url} - missing intermediate certificate for issuer: {issuer}"
-        
-        # Unknown CA - needs cert info for CA name
-        if 'unknown ca' in error_lower or 'unable to get issuer' in error_lower:
-            ca_name = get_cert_info().get('issuer_name', 'unknown')
-            return f"SSL certificate from unknown CA \"{ca_name}\" for URL: {url} - use a trusted CA like Let's Encrypt"
-        
-        # TLS handshake failure - needs cert info for TLS version
-        if 'handshake failure' in error_lower or 'handshake_failure' in error_lower:
-            server_tls = get_cert_info().get('tls_version', 'unknown version')
-            return f"TLS handshake failed for URL: {url} - server offered {server_tls}, minimum required is TLS 1.2"
-        
-        # Generic SSL error - no cert info needed
+        # Generic fallback
         return f"SSL error for URL: {url}: {error_str[:150]}"
     
     def _extract_domain(self, url: str) -> Optional[str]:
@@ -748,6 +718,38 @@ def run_validation(
             progress_callback(idx, total, result)
     
     return results
+
+
+def results_to_dataframe(results: list, include_error: bool = False) -> "pd.DataFrame":
+    """
+    Convert validation results to a pandas DataFrame.
+    
+    Args:
+        results: List of validation result dictionaries
+        include_error: Whether to include the error column
+        
+    Returns:
+        pandas DataFrame with formatted results
+    """
+    import pandas as pd
+    
+    columns = ['Nickname', 'Fingerprint', 'Valid', 'Proof Type', 'Domain']
+    if include_error:
+        columns.append('Error')
+    
+    df_data = [
+        {
+            'Nickname': r.get('nickname', 'Unknown'),
+            'Fingerprint': r.get('fingerprint', ''),
+            'Valid': '✅' if r.get('valid') else '❌',
+            'Proof Type': r.get('proof_type') or 'None',
+            'Domain': r.get('domain') or 'N/A',
+            **(({'Error': r.get('error') or ''}) if include_error else {})
+        }
+        for r in results
+    ]
+    
+    return pd.DataFrame(df_data, columns=columns)
 
 
 def calculate_statistics(results: List[Dict]) -> Dict:

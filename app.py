@@ -7,121 +7,8 @@ import json
 import os
 from datetime import datetime
 
-
-# ============================================================================
-# 1AEO BRANDING (Application Hosting Layer)
-# ============================================================================
-
-def render_1aeo_navigation():
-    """Render 1AEO cross-site navigation bar"""
-    import streamlit as st
-    st.markdown("""
-    <style>
-        .aeo-nav {
-            background-color: #1e1e1e;
-            padding: 12px 20px;
-            margin: -1rem -1rem 1.5rem -1rem;
-            border-bottom: 1px solid rgba(0,255,127,0.2);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        .aeo-nav a { color: #cccccc; text-decoration: none; font-size: 14px; transition: color 0.2s; }
-        .aeo-nav a:hover { color: #00ff7f; }
-        .aeo-nav .brand { color: #00ff7f; font-weight: bold; font-size: 16px; }
-        .aeo-nav .active { color: #00ff7f; font-weight: 500; }
-        .aeo-nav .links { display: flex; gap: 20px; flex-wrap: wrap; }
-    </style>
-    <div class="aeo-nav">
-        <a href="https://www.1aeo.com" class="brand">1AEO</a>
-        <div class="links">
-            <a href="https://www.1aeo.com">Home</a>
-            <a href="https://metrics.1aeo.com">Metrics</a>
-            <a href="https://aroivalidator.1aeo.com" class="active">Validator</a>
-            <a href="https://routefluxmap.1aeo.com">FluxMap</a>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-def render_1aeo_styles():
-    """Render additional 1AEO brand styling"""
-    import streamlit as st
-    st.markdown("""
-    <style>
-        [data-testid="stSidebar"] { border-right: 1px solid rgba(0,255,127,0.2); }
-        [data-testid="stMetric"] {
-            background-color: #1e1e1e;
-            padding: 15px;
-            border-radius: 8px;
-            border: 1px solid rgba(0,255,127,0.1);
-        }
-        .stButton > button:hover {
-            border-color: #00ff7f;
-            box-shadow: 0 0 10px rgba(0,255,127,0.3);
-        }
-        [data-testid="stDataFrame"] {
-            border: 1px solid rgba(0,255,127,0.1);
-            border-radius: 8px;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
-
-def render_1aeo_footer():
-    """Render 1AEO footer with cross-site links"""
-    import streamlit as st
-    st.markdown("""
-    <div style="margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid rgba(0,255,127,0.2); text-align: center; color: #888;">
-        <div style="margin-bottom: 10px;">
-            <a href="https://metrics.1aeo.com" style="color: #00ff7f; margin: 0 10px;">Metrics</a> |
-            <a href="https://aroivalidator.1aeo.com" style="color: #00ff7f; margin: 0 10px;">Validator</a> |
-            <a href="https://routefluxmap.1aeo.com" style="color: #00ff7f; margin: 0 10px;">FluxMap</a>
-        </div>
-        <p style="font-size: 12px; margin: 0;">
-            <a href="https://www.1aeo.com" style="color: #00ff7f;">1AEO</a> · 
-            <a href="https://github.com/1aeo" style="color: #888;">GitHub</a>
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-
-# ============================================================================
-# UTILITY FUNCTIONS
-# ============================================================================
-
-def _results_to_dataframe(results: list, include_error: bool = False):
-    """
-    Convert validation results to a pandas DataFrame.
-    
-    Args:
-        results: List of validation result dictionaries
-        include_error: Whether to include the error column
-        
-    Returns:
-        pandas DataFrame with formatted results
-    """
-    import pandas as pd
-    
-    columns = ['Nickname', 'Fingerprint', 'Valid', 'Proof Type', 'Domain']
-    if include_error:
-        columns.append('Error')
-    
-    df_data = [
-        {
-            'Nickname': r.get('nickname', 'Unknown'),
-            'Fingerprint': r.get('fingerprint', ''),
-            'Valid': '✅' if r.get('valid') else '❌',
-            'Proof Type': r.get('proof_type') or 'None',
-            'Domain': r.get('domain') or 'N/A',
-            **(({'Error': r.get('error') or ''}) if include_error else {})
-        }
-        for r in results
-    ]
-    
-    return pd.DataFrame(df_data, columns=columns)
+# Import branding components from dedicated module
+from branding import render_1aeo_navigation, render_1aeo_styles, render_1aeo_footer
 
 
 def interactive_mode():
@@ -129,7 +16,7 @@ def interactive_mode():
     import streamlit as st
     from aroi_validator import (
         run_validation, calculate_statistics, save_results,
-        load_results, list_result_files
+        load_results, list_result_files, results_to_dataframe
     )
     
     st.set_page_config(
@@ -244,7 +131,7 @@ def interactive_mode():
         
         # Results table
         st.subheader("📋 Detailed Results")
-        df = _results_to_dataframe(results, include_error=True)
+        df = results_to_dataframe(results, include_error=True)
         st.dataframe(df, use_container_width=True, hide_index=True)
     
     # Header
@@ -324,7 +211,7 @@ def interactive_mode():
 def viewer_mode():
     """View saved validation results"""
     import streamlit as st
-    from aroi_validator import load_results, list_result_files
+    from aroi_validator import load_results, list_result_files, results_to_dataframe
     
     st.set_page_config(
         page_title="AROI Validator - Results Viewer",
@@ -370,7 +257,7 @@ def viewer_mode():
     
     # Results table
     st.subheader("Detailed Results")
-    df = _results_to_dataframe(data.get('results', []), include_error=False)
+    df = results_to_dataframe(data.get('results', []), include_error=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
     
     # 1AEO Footer
