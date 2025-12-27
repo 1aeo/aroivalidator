@@ -13,24 +13,62 @@ import dns.dnssec
 import dns.rdatatype
 import ssl
 import urllib3
+import logging
 from typing import Dict, Any, List, Optional, Callable
 from urllib.parse import urlparse, urljoin
 from datetime import datetime
 from pathlib import Path
 
-# Disable SSL warnings for legacy servers
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Configure logging for security events
+logger = logging.getLogger(__name__)
+
+# Note: SSL warnings are intentionally NOT disabled globally.
+# Legacy TLS connections will log warnings when used.
 
 
-class LegacyTLSAdapter(requests.adapters.HTTPAdapter):
-    """Custom adapter to support legacy TLS versions"""
+class SecureTLSAdapter(requests.adapters.HTTPAdapter):
+    """
+    TLS adapter with configurable security settings.
+    
+    By default uses secure settings (TLS 1.2+, certificate verification).
+    Can be configured for legacy server compatibility when explicitly needed.
+    """
+    
+    def __init__(self, verify_certificates: bool = True, allow_legacy_tls: bool = False, **kwargs):
+        """
+        Initialize the TLS adapter.
+        
+        Args:
+            verify_certificates: Whether to verify SSL certificates (default: True)
+            allow_legacy_tls: Whether to allow TLS 1.0/1.1 for legacy servers (default: False)
+        """
+        self.verify_certificates = verify_certificates
+        self.allow_legacy_tls = allow_legacy_tls
+        super().__init__(**kwargs)
+    
     def init_poolmanager(self, *args, **kwargs):
         ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        # Enable support for older TLS versions
-        ctx.minimum_version = ssl.TLSVersion.TLSv1
-        ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        
+        if self.verify_certificates:
+            # Secure mode: verify certificates and hostnames
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        else:
+            # Legacy mode: disable verification (logged as warning)
+            logger.warning("SSL certificate verification disabled - vulnerable to MITM attacks")
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        
+        if self.allow_legacy_tls:
+            # Allow TLS 1.2 as minimum (TLS 1.0/1.1 are deprecated and insecure)
+            # Even in legacy mode, we use TLS 1.2 as the minimum secure version
+            logger.warning("Legacy TLS mode enabled - using relaxed cipher settings")
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            ctx.set_ciphers('DEFAULT@SECLEVEL=1')
+        else:
+            # Modern secure mode: TLS 1.2+ with strong ciphers
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        
         kwargs['ssl_context'] = ctx
         return super().init_poolmanager(*args, **kwargs)
 
@@ -38,17 +76,48 @@ class LegacyTLSAdapter(requests.adapters.HTTPAdapter):
 class ParallelAROIValidator:
     """Simplified AROI validator with parallel processing support"""
     
-    def __init__(self, max_workers: int = 10):
+    def __init__(
+        self, 
+        max_workers: int = 10,
+        verify_certificates: bool = False,
+        allow_legacy_tls: bool = True
+    ):
+        """
+        Initialize the validator.
+        
+        Args:
+            max_workers: Maximum number of parallel workers
+            verify_certificates: Whether to verify SSL certificates (default: False for 
+                compatibility with self-signed certs on Tor relay operator domains)
+            allow_legacy_tls: Whether to allow legacy TLS settings (default: True)
+        
+        Security Note: Certificate verification is disabled by default because many Tor
+        relay operators use self-signed certificates or have misconfigured TLS. This is
+        a known trade-off for this specific use case. The validator only fetches public
+        proof files, not sensitive data.
+        """
+        # Validate max_workers to prevent resource exhaustion
+        if not isinstance(max_workers, int) or max_workers < 1:
+            raise ValueError("max_workers must be a positive integer")
+        if max_workers > 100:
+            logger.warning(f"max_workers={max_workers} is very high, limiting to 100")
+            max_workers = 100
+        
         self.max_workers = max_workers
+        self.verify_certificates = verify_certificates
         self.onionoo_url = "https://onionoo.torproject.org/details"
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'AROIValidator/1.0'
         })
-        # Mount legacy TLS adapter for both http and https
-        legacy_adapter = LegacyTLSAdapter()
-        self.session.mount('https://', legacy_adapter)
-        self.session.mount('http://', legacy_adapter)
+        
+        # Configure TLS adapter with explicit security settings
+        tls_adapter = SecureTLSAdapter(
+            verify_certificates=verify_certificates,
+            allow_legacy_tls=allow_legacy_tls
+        )
+        self.session.mount('https://', tls_adapter)
+        self.session.mount('http://', tls_adapter)
         
     def fetch_relay_data(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
@@ -242,8 +311,12 @@ class ParallelAROIValidator:
         
         for proof_url in urls_to_try:
             try:
-                # Try with legacy TLS support (adapter handles SSL context)
-                response = self.session.get(proof_url, timeout=10, verify=False)
+                # Use session's configured TLS settings (adapter handles SSL context)
+                response = self.session.get(
+                    proof_url, 
+                    timeout=10, 
+                    verify=self.verify_certificates
+                )
                 response.raise_for_status()
                 
                 # Check if fingerprint is listed in the file
@@ -288,13 +361,29 @@ class ParallelAROIValidator:
         return False
     
     def _extract_domain(self, url: str) -> Optional[str]:
-        """Extract domain from URL"""
+        """
+        Extract domain from URL.
+        
+        Args:
+            url: The URL to extract domain from
+            
+        Returns:
+            Domain string or None if extraction fails
+        """
+        if not url or not isinstance(url, str):
+            return None
+            
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         try:
             parsed = urlparse(url)
-            return parsed.netloc or parsed.path.split('/')[0]
-        except:
+            domain = parsed.netloc or parsed.path.split('/')[0]
+            # Basic domain validation
+            if domain and '.' in domain:
+                return domain
+            return None
+        except (ValueError, AttributeError) as e:
+            logger.debug(f"Failed to extract domain from {url}: {e}")
             return None
     
     def _validate_proof_content(self, content_list: List[str], fingerprint: str) -> bool:
@@ -381,7 +470,9 @@ def run_validation(
     stop_check: Optional[Callable] = None,
     limit: Optional[int] = None,
     parallel: bool = True,
-    max_workers: int = 10
+    max_workers: int = 10,
+    verify_certificates: bool = False,
+    allow_legacy_tls: bool = True
 ) -> List[Dict[str, Any]]:
     """
     Run AROI validation with optional parallel processing
@@ -389,14 +480,33 @@ def run_validation(
     Args:
         progress_callback: Function to call with (current, total, result)
         stop_check: Function that returns True if validation should stop
-        limit: Maximum number of relays to validate
+        limit: Maximum number of relays to validate (None for all, must be positive if set)
         parallel: Whether to use parallel processing
-        max_workers: Number of parallel workers (if parallel=True)
+        max_workers: Number of parallel workers (if parallel=True), must be 1-100
+        verify_certificates: Whether to verify SSL certificates
+        allow_legacy_tls: Whether to allow legacy TLS settings
     
     Returns:
         List of validation results
+        
+    Raises:
+        ValueError: If parameters are invalid
     """
-    validator = ParallelAROIValidator(max_workers=max_workers if parallel else 1)
+    # Validate inputs
+    if limit is not None:
+        if not isinstance(limit, int) or limit < 0:
+            raise ValueError("limit must be a non-negative integer or None")
+    
+    if not isinstance(max_workers, int) or max_workers < 1:
+        raise ValueError("max_workers must be a positive integer")
+    
+    max_workers = min(max_workers, 100)  # Cap at 100 workers
+    
+    validator = ParallelAROIValidator(
+        max_workers=max_workers if parallel else 1,
+        verify_certificates=verify_certificates,
+        allow_legacy_tls=allow_legacy_tls
+    )
     
     if parallel:
         print(f"Using parallel validation with {max_workers} workers")
@@ -460,14 +570,30 @@ def calculate_statistics(results: List[Dict]) -> Dict:
 
 
 def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
-    """Save validation results to JSON file"""
-    results_dir = Path('validation_results')
+    """
+    Save validation results to JSON file.
+    
+    Args:
+        results: List of validation results to save
+        filename: Optional custom filename (will be sanitized)
+        
+    Returns:
+        Path to the saved file
+        
+    Raises:
+        ValueError: If the filename is invalid
+        OSError: If the file cannot be written
+    """
+    results_dir = Path('validation_results').resolve()
     results_dir.mkdir(exist_ok=True)
     
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     
     if filename is None:
         filename = f'aroi_validation_{timestamp}.json'
+    else:
+        # Sanitize user-provided filename
+        filename = _sanitize_filename(filename)
     
     statistics = calculate_statistics(results)
     
@@ -485,6 +611,11 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     
     # Save with timestamp
     file_path = results_dir / filename
+    
+    # Verify the path is within the results directory (defense in depth)
+    if not str(file_path.resolve()).startswith(str(results_dir)):
+        raise ValueError("Invalid filename: path traversal detected")
+    
     with open(file_path, 'w') as f:
         json.dump(output_data, f, indent=2)
     
@@ -496,10 +627,77 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     return file_path
 
 
+def _sanitize_filename(filename: str) -> str:
+    """
+    Sanitize filename to prevent path traversal attacks.
+    
+    Args:
+        filename: The filename to sanitize
+        
+    Returns:
+        Sanitized filename with only the base name component
+        
+    Raises:
+        ValueError: If the filename is invalid or empty after sanitization
+    """
+    if not filename:
+        raise ValueError("Filename cannot be empty")
+    
+    # Get only the base name to prevent path traversal
+    safe_name = Path(filename).name
+    
+    # Ensure no path separators remain
+    if '/' in safe_name or '\\' in safe_name:
+        raise ValueError("Invalid filename: contains path separators")
+    
+    # Reject names that start with dots (hidden files) except for specific allowed names
+    if safe_name.startswith('.') and safe_name not in ['.json']:
+        raise ValueError("Invalid filename: hidden files not allowed")
+    
+    # Validate the filename contains only safe characters
+    import string
+    allowed_chars = set(string.ascii_letters + string.digits + '._-')
+    if not all(c in allowed_chars for c in safe_name):
+        raise ValueError("Invalid filename: contains invalid characters")
+    
+    # Ensure it ends with .json
+    if not safe_name.endswith('.json'):
+        raise ValueError("Invalid filename: must end with .json")
+    
+    return safe_name
+
+
 def load_results(filename: str = 'latest.json') -> Optional[Dict]:
-    """Load validation results from JSON file"""
-    results_dir = Path('validation_results')
-    file_path = results_dir / filename
+    """
+    Load validation results from JSON file.
+    
+    Args:
+        filename: Name of the file to load (must be within validation_results directory)
+        
+    Returns:
+        Parsed JSON data or None if file doesn't exist or is invalid
+        
+    Security:
+        Filename is sanitized to prevent path traversal attacks.
+    """
+    results_dir = Path('validation_results').resolve()
+    
+    try:
+        safe_filename = _sanitize_filename(filename)
+    except ValueError as e:
+        logger.warning(f"Invalid filename rejected: {filename} - {e}")
+        return None
+    
+    file_path = results_dir / safe_filename
+    
+    # Double-check that the resolved path is within the results directory
+    try:
+        file_path = file_path.resolve()
+        if not str(file_path).startswith(str(results_dir)):
+            logger.warning(f"Path traversal attempt detected: {filename}")
+            return None
+    except (OSError, ValueError):
+        return None
     
     if not file_path.exists():
         return None
@@ -507,7 +705,11 @@ def load_results(filename: str = 'latest.json') -> Optional[Dict]:
     try:
         with open(file_path, 'r') as f:
             return json.load(f)
-    except Exception:
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in {safe_filename}: {e}")
+        return None
+    except OSError as e:
+        logger.error(f"Error reading {safe_filename}: {e}")
         return None
 
 

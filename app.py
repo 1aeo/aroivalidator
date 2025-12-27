@@ -273,6 +273,34 @@ def viewer_mode():
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
+def _get_validated_env_int(name: str, default: int, min_val: int, max_val: int) -> int:
+    """
+    Get and validate an integer environment variable.
+    
+    Args:
+        name: Environment variable name
+        default: Default value if not set
+        min_val: Minimum allowed value
+        max_val: Maximum allowed value
+        
+    Returns:
+        Validated integer value
+    """
+    value_str = os.environ.get(name, str(default))
+    try:
+        value = int(value_str)
+        if value < min_val:
+            print(f"Warning: {name}={value} is below minimum ({min_val}), using {min_val}")
+            return min_val
+        if value > max_val:
+            print(f"Warning: {name}={value} is above maximum ({max_val}), using {max_val}")
+            return max_val
+        return value
+    except ValueError:
+        print(f"Warning: Invalid {name}='{value_str}', using default {default}")
+        return default
+
+
 def batch_mode():
     """Batch validation mode for automation"""
     from aroi_validator import (
@@ -283,10 +311,12 @@ def batch_mode():
     print("=" * 50)
     print(f"Starting validation at {datetime.now().isoformat()}")
     
-    # Configuration from environment
-    limit = int(os.environ.get('BATCH_LIMIT', 100))
-    use_parallel = os.environ.get('PARALLEL', 'true').lower() == 'true'
-    max_workers = int(os.environ.get('MAX_WORKERS', 10))
+    # Configuration from environment with validation
+    limit = _get_validated_env_int('BATCH_LIMIT', default=100, min_val=0, max_val=50000)
+    max_workers = _get_validated_env_int('MAX_WORKERS', default=10, min_val=1, max_val=100)
+    
+    parallel_str = os.environ.get('PARALLEL', 'true').lower()
+    use_parallel = parallel_str in ('true', '1', 'yes', 'on')
     
     if use_parallel:
         print(f"Using parallel processing with {max_workers} workers")

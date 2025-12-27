@@ -100,6 +100,40 @@ Results saved to `validation_results/` as JSON:
 
 ## Security Notes
 
-- Custom TLS adapter for legacy Tor relay compatibility (TLSv1+)
-- Reduced security level (SECLEVEL=1) for older cipher support
-- Required for communicating with legacy Tor infrastructure
+### TLS/SSL Configuration
+
+The validator uses configurable TLS settings to balance security with compatibility:
+
+- **Minimum TLS Version**: TLS 1.2 (TLS 1.0/1.1 are deprecated and no longer supported)
+- **Legacy Mode**: Relaxed cipher settings (SECLEVEL=1) available for older servers
+- **Certificate Verification**: Disabled by default for relay operator domains (see below)
+
+### Certificate Verification
+
+Certificate verification is disabled by default when connecting to relay operator domains because:
+1. Many Tor relay operators use self-signed certificates
+2. Some have misconfigured TLS (expired certs, wrong hostnames)
+3. The validator only fetches public proof files, not sensitive data
+
+This is a deliberate security trade-off for this specific use case. The Onionoo API (torproject.org) connections always use proper TLS verification.
+
+### Input Validation
+
+- **File Operations**: All filenames are sanitized to prevent path traversal attacks
+- **Environment Variables**: Batch mode validates and bounds all configuration values
+- **Worker Limits**: Maximum 100 parallel workers to prevent resource exhaustion
+
+### Logging
+
+Security-relevant events are logged:
+- Disabled certificate verification warnings
+- Legacy TLS mode activation
+- Invalid filename attempts (potential path traversal)
+- JSON parsing errors
+
+### Recommendations for Production Use
+
+1. Run in a sandboxed environment if processing untrusted relay data
+2. Monitor logs for security warnings
+3. Consider enabling certificate verification if your target relays support it
+4. Use appropriate network firewall rules to limit outbound connections
