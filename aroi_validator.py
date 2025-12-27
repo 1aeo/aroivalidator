@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 _ALLOWED_FILENAME_CHARS = frozenset(string.ascii_letters + string.digits + '._-')
 _MAX_WORKERS_LIMIT = 100
 
+# Default configuration constants (DRY - single source of truth)
+DEFAULT_VERIFY_CERTIFICATES = True
+DEFAULT_ALLOW_LEGACY_TLS = True
+DEFAULT_MAX_RETRIES = 1  # Retry once on timeout/connection refused
+DEFAULT_TIMEOUT_SECONDS = 10
+
 
 class SecureTLSAdapter(requests.adapters.HTTPAdapter):
     """
@@ -80,8 +86,8 @@ class ParallelAROIValidator:
     def __init__(
         self, 
         max_workers: int = 10,
-        verify_certificates: bool = False,
-        allow_legacy_tls: bool = True
+        verify_certificates: bool = DEFAULT_VERIFY_CERTIFICATES,
+        allow_legacy_tls: bool = DEFAULT_ALLOW_LEGACY_TLS
     ):
         """
         Initialize the validator.
@@ -196,9 +202,9 @@ class ParallelAROIValidator:
             return result
         
         # Parse AROI fields
-        aroi_fields = self._parse_aroi_fields(contact)
+        aroi_fields, missing_fields = self._parse_aroi_fields(contact)
         if not aroi_fields:
-            result['error'] = "Missing AROI fields"
+            result['error'] = f"Missing AROI fields: {', '.join(missing_fields)}"
             return result
         
         # Check ciissversion
@@ -217,9 +223,15 @@ class ParallelAROIValidator:
         
         return result
     
-    def _parse_aroi_fields(self, contact: str) -> Optional[Dict[str, str]]:
-        """Parse AROI fields from contact information"""
+    def _parse_aroi_fields(self, contact: str) -> tuple:
+        """
+        Parse AROI fields from contact information.
+        
+        Returns:
+            Tuple of (fields_dict or None, list of missing required field names)
+        """
         fields = {}
+        required_fields = ['ciissversion', 'proof']
         patterns = {
             'ciissversion': r'\bciissversion:(\S+)',
             'proof': r'\bproof:(\S+)',
@@ -232,19 +244,23 @@ class ParallelAROIValidator:
             if match:
                 fields[field] = match.group(1)
         
-        return fields if 'ciissversion' in fields and 'proof' in fields else None
+        missing = [f for f in required_fields if f not in fields]
+        
+        if 'ciissversion' in fields and 'proof' in fields:
+            return fields, missing
+        return None, missing
     
     def _validate_dns_rsa(self, relay: Dict, aroi_fields: Dict, result: Dict) -> Dict:
         """Validate DNS-RSA proof"""
         url = aroi_fields.get('url')
         if not url:
-            result['error'] = "Missing URL for dns-rsa proof"
+            result['error'] = "Missing URL for DNS-RSA proof"
             return result
         
         # Extract domain
         domain = self._extract_domain(url)
         if not domain:
-            result['error'] = "Invalid URL for DNS lookup"
+            result['error'] = f"Invalid URL for DNS-RSA proof: {url}"
             return result
         
         result['proof_type'] = 'dns-rsa'
@@ -268,7 +284,9 @@ class ParallelAROIValidator:
                     'details': f"Found valid proof at {query_domain}"
                 })
             else:
-                result['error'] = "Invalid proof content in DNS TXT record"
+                # Show actual content found
+                found_content = '; '.join(txt_records)[:100] if txt_records else 'empty'
+                result['error'] = f"Invalid proof content in DNS TXT record: expected 'we-run-this-tor-relay', found: {found_content}"
         except Exception as e:
             result['error'] = f"DNS lookup failed: {str(e)}"
         
@@ -307,15 +325,10 @@ class ParallelAROIValidator:
         all_errors = []
         
         for proof_url in urls_to_try:
-            try:
-                # Use session's configured TLS settings (adapter handles SSL context)
-                response = self.session.get(
-                    proof_url, 
-                    timeout=10, 
-                    verify=self.verify_certificates
-                )
-                response.raise_for_status()
-                
+            # Use fetch with retry for transient failures
+            response, error, attempts = self._fetch_with_retry(proof_url)
+            
+            if response:
                 # Check if fingerprint is listed in the file
                 if self._check_fingerprint_in_response(response.text, fingerprint):
                     result['valid'] = True
@@ -326,14 +339,9 @@ class ParallelAROIValidator:
                     })
                     return result
                 else:
-                    all_errors.append(f"Fingerprint not found in {proof_url}")
-                    
-            except requests.exceptions.HTTPError as e:
-                # Handle HTTP errors (403, 404, etc.)
-                all_errors.append(f"{e.response.status_code} {e.response.reason} for {proof_url}")
-                
-            except Exception as e:
-                all_errors.append(f"Failed to fetch {proof_url}: {str(e)}")
+                    all_errors.append(f"Fingerprint not found in URL: fingerprint {fingerprint} not listed at {proof_url}")
+            else:
+                all_errors.append(error)
         
         # If we get here, all attempts failed - show all errors
         if len(all_errors) > 1:
@@ -353,6 +361,207 @@ class ParallelAROIValidator:
             if line.strip() and not line.strip().startswith('#')
         }
         return fingerprint in valid_fingerprints
+    
+    def _get_ssl_cert_info(self, hostname: str, port: int = 443) -> Dict[str, Any]:
+        """
+        Fetch SSL certificate details for detailed error messages.
+        
+        Returns dict with: expiration, issuer_name, hostnames, tls_version, etc.
+        """
+        import socket
+        
+        try:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            
+            with socket.create_connection((hostname, port), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                    cert = ssock.getpeercert(binary_form=False)
+                    tls_version = ssock.version()  # e.g., 'TLSv1.2', 'TLSv1.3'
+                    
+                    if not cert:
+                        return {'tls_version': tls_version}
+                    
+                    # Expiration date
+                    not_after = cert.get('notAfter', '')
+                    try:
+                        exp_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
+                        exp_str = exp_date.strftime('%Y-%m-%d')
+                    except (ValueError, TypeError):
+                        exp_str = not_after
+                    
+                    # Issuer information
+                    issuer = cert.get('issuer', [])
+                    issuer_dict = {}
+                    for item in issuer:
+                        if isinstance(item, tuple) and len(item) == 2:
+                            issuer_dict[item[0]] = item[1]
+                        elif isinstance(item, tuple):
+                            for subitem in item:
+                                if isinstance(subitem, tuple) and len(subitem) == 2:
+                                    issuer_dict[subitem[0]] = subitem[1]
+                    
+                    issuer_cn = issuer_dict.get('commonName', '')
+                    issuer_org = issuer_dict.get('organizationName', '')
+                    issuer_name = issuer_cn or issuer_org or 'Unknown'
+                    
+                    # Subject hostnames
+                    subject = cert.get('subject', [])
+                    subject_dict = {}
+                    for item in subject:
+                        if isinstance(item, tuple):
+                            for subitem in item:
+                                if isinstance(subitem, tuple) and len(subitem) == 2:
+                                    subject_dict[subitem[0]] = subitem[1]
+                    
+                    cn = subject_dict.get('commonName', '')
+                    san = [x[1] for x in cert.get('subjectAltName', []) if x[0] == 'DNS']
+                    
+                    return {
+                        'expiration': exp_str,
+                        'issuer_name': issuer_name,
+                        'issuer_cn': issuer_cn,
+                        'issuer_org': issuer_org,
+                        'common_name': cn,
+                        'subject_alt_names': san,
+                        'hostnames': list(set([cn] + san)) if cn else san,
+                        'tls_version': tls_version
+                    }
+        except Exception as e:
+            return {'error': str(e)}
+    
+    def _fetch_with_retry(self, url: str, max_retries: int = DEFAULT_MAX_RETRIES) -> tuple:
+        """
+        Fetch URL with retry logic for transient failures.
+        
+        Args:
+            url: The URL to fetch
+            max_retries: Number of retries (default: 1)
+            
+        Returns:
+            Tuple of (response or None, error_message, attempt_count)
+        """
+        max_attempts = max_retries + 1
+        last_error = ""
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = self.session.get(
+                    url, 
+                    timeout=DEFAULT_TIMEOUT_SECONDS, 
+                    verify=self.verify_certificates
+                )
+                response.raise_for_status()
+                return response, "", attempt
+                
+            except requests.exceptions.Timeout as e:
+                last_error = f"Connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url} (attempt {attempt}/{max_attempts})"
+                if attempt < max_attempts:
+                    continue  # Retry
+                    
+            except requests.exceptions.ConnectionError as e:
+                error_str = str(e).lower()
+                if 'refused' in error_str:
+                    last_error = f"Connection refused for URL: {url} (attempt {attempt}/{max_attempts})"
+                    if attempt < max_attempts:
+                        continue  # Retry
+                elif 'reset' in error_str:
+                    last_error = f"Connection reset for URL: {url} (attempt {attempt}/{max_attempts})"
+                    if attempt < max_attempts:
+                        continue  # Retry
+                else:
+                    last_error = f"Connection error for URL: {url}: {str(e)[:100]}"
+                    break  # Don't retry other connection errors
+                    
+            except requests.exceptions.SSLError as e:
+                last_error = self._categorize_ssl_error(str(e), url, attempt, max_attempts)
+                break  # Don't retry SSL errors
+                
+            except requests.exceptions.HTTPError as e:
+                last_error = f"HTTP error {e.response.status_code} {e.response.reason} for URL: {url}"
+                break  # Don't retry HTTP errors
+                
+            except Exception as e:
+                last_error = f"Failed to fetch URL: {url}: {str(e)[:100]}"
+                break
+        
+        return None, last_error, attempt
+    
+    def _categorize_ssl_error(self, error_str: str, url: str, attempt: int = 1, max_attempts: int = 2) -> str:
+        """
+        Categorize SSL errors and return detailed, actionable error messages.
+        
+        Args:
+            error_str: The SSL error string
+            url: The URL that failed
+            attempt: Current attempt number
+            max_attempts: Total number of attempts made
+            
+        Returns:
+            A detailed error message with diagnostic information
+        """
+        parsed = urlparse(url)
+        hostname = parsed.netloc
+        error_lower = error_str.lower()
+        
+        # Try to get certificate info for detailed messages
+        cert_info = self._get_ssl_cert_info(hostname)
+        
+        # Connection timeout - include timeout duration and attempt count
+        if 'timed out' in error_lower or 'timeout' in error_lower:
+            return f"Connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url} (attempt {attempt}/{max_attempts})"
+        
+        # Connection refused - include attempt count
+        if 'connection refused' in error_lower:
+            return f"Connection refused for URL: {url} (attempt {attempt}/{max_attempts})"
+        
+        # Certificate expired - include expiration date
+        if 'certificate has expired' in error_lower or 'cert_has_expired' in error_lower:
+            exp_date = cert_info.get('expiration', 'unknown date')
+            return f"SSL certificate expired on {exp_date} for URL: {url}"
+        
+        # Hostname mismatch - include certificate hostnames
+        if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
+            cert_hosts = cert_info.get('hostnames', ['unknown'])
+            cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
+            return f"SSL hostname mismatch: certificate valid for {cert_hosts_str} but URL hostname is {hostname}"
+        
+        # Self-signed certificate in chain - include issuer name
+        if 'self signed certificate in certificate chain' in error_lower:
+            issuer = cert_info.get('issuer_name', 'unknown issuer')
+            return f"SSL certificate chain contains self-signed certificate (issuer: {issuer}) for URL: {url}"
+        
+        # Self-signed certificate - include issuer name
+        if 'self signed certificate' in error_lower or 'self_signed_cert' in error_lower:
+            issuer = cert_info.get('issuer_name', 'unknown issuer')
+            return f"SSL certificate is self-signed (issuer: {issuer}) for URL: {url} - use a trusted CA like Let's Encrypt"
+        
+        # Incomplete chain - include missing issuer info
+        if 'unable to get local issuer' in error_lower:
+            issuer = cert_info.get('issuer_name', 'unknown')
+            return f"SSL certificate chain incomplete for URL: {url} - missing intermediate certificate for issuer: {issuer}"
+        
+        # Unknown CA - include CA name
+        if 'unknown ca' in error_lower or 'unable to get issuer' in error_lower:
+            ca_name = cert_info.get('issuer_name', 'unknown')
+            return f"SSL certificate from unknown CA \"{ca_name}\" for URL: {url} - use a trusted CA like Let's Encrypt"
+        
+        # Certificate verify failed (general)
+        if 'certificate verify failed' in error_lower:
+            return f"SSL certificate verification failed for URL: {url}"
+        
+        # TLS handshake failure - include TLS versions
+        if 'handshake failure' in error_lower or 'handshake_failure' in error_lower:
+            server_tls = cert_info.get('tls_version', 'unknown version')
+            return f"TLS handshake failed for URL: {url} - server offered {server_tls}, minimum required is TLS 1.2"
+        
+        # Connection reset
+        if 'connection reset' in error_lower:
+            return f"Connection reset for URL: {url} (attempt {attempt}/{max_attempts})"
+        
+        # Generic SSL error
+        return f"SSL error for URL: {url}: {error_str[:150]}"
     
     def _extract_domain(self, url: str) -> Optional[str]:
         """
@@ -465,8 +674,8 @@ def run_validation(
     limit: Optional[int] = None,
     parallel: bool = True,
     max_workers: int = 10,
-    verify_certificates: bool = False,
-    allow_legacy_tls: bool = True
+    verify_certificates: bool = DEFAULT_VERIFY_CERTIFICATES,
+    allow_legacy_tls: bool = DEFAULT_ALLOW_LEGACY_TLS
 ) -> List[Dict[str, Any]]:
     """
     Run AROI validation with optional parallel processing.
