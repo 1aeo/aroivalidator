@@ -6,9 +6,10 @@ import concurrent.futures
 import json
 import logging
 import re
+import socket
 import ssl
 import string
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable
 from urllib.parse import urlparse
@@ -33,6 +34,18 @@ DEFAULT_VERIFY_CERTIFICATES = True
 DEFAULT_ALLOW_LEGACY_TLS = True
 DEFAULT_MAX_RETRIES = 1  # Retry once on timeout/connection refused
 DEFAULT_TIMEOUT_SECONDS = 10
+
+# Proof type constants (DRY - avoid magic strings)
+PROOF_TYPE_DNS_RSA = "dns-rsa"
+PROOF_TYPE_URI_RSA = "uri-rsa"
+
+# Pre-compiled regex patterns for AROI field parsing (efficiency)
+_AROI_PATTERNS = {
+    'ciissversion': re.compile(r'\bciissversion:(\S+)', re.IGNORECASE),
+    'proof': re.compile(r'\bproof:(\S+)', re.IGNORECASE),
+    'url': re.compile(r'\burl:(\S+)', re.IGNORECASE),
+    'email': re.compile(r'\bemail:(\S+)', re.IGNORECASE),
+}
 
 
 class SecureTLSAdapter(requests.adapters.HTTPAdapter):
@@ -147,8 +160,8 @@ class ParallelAROIValidator:
             filtered_relays = self._filter_active_relays(relays)
             
             return filtered_relays[:limit] if limit else filtered_relays
-        except Exception as e:
-            print(f"Error fetching relay data: {e}")
+        except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
+            logger.error(f"Error fetching relay data: {e}")
             return []
     
     def _filter_active_relays(self, relays: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -158,7 +171,7 @@ class ParallelAROIValidator:
         Workaround for Onionoo API bug where relays offline for over a year are returned
         despite documentation stating only relays from the past week are included.
         """
-        cutoff_date = datetime.utcnow() - timedelta(days=14)
+        cutoff_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=14)
         active_relays = []
         
         for relay in relays:
@@ -214,9 +227,9 @@ class ParallelAROIValidator:
         
         # Validate based on proof type
         proof_type = aroi_fields.get('proof')
-        if proof_type == 'dns-rsa':
+        if proof_type == PROOF_TYPE_DNS_RSA:
             result = self._validate_dns_rsa(relay, aroi_fields, result)
-        elif proof_type == 'uri-rsa':
+        elif proof_type == PROOF_TYPE_URI_RSA:
             result = self._validate_uri_rsa(relay, aroi_fields, result)
         else:
             result['error'] = f"Unsupported proof type: {proof_type}"
@@ -232,15 +245,10 @@ class ParallelAROIValidator:
         """
         fields = {}
         required_fields = ['ciissversion', 'proof']
-        patterns = {
-            'ciissversion': r'\bciissversion:(\S+)',
-            'proof': r'\bproof:(\S+)',
-            'url': r'\burl:(\S+)',
-            'email': r'\bemail:(\S+)'
-        }
         
-        for field, pattern in patterns.items():
-            match = re.search(pattern, contact, re.IGNORECASE)
+        # Use pre-compiled patterns for efficiency
+        for field, pattern in _AROI_PATTERNS.items():
+            match = pattern.search(contact)
             if match:
                 fields[field] = match.group(1)
         
@@ -263,7 +271,7 @@ class ParallelAROIValidator:
             result['error'] = f"Invalid URL for DNS-RSA proof: {url}"
             return result
         
-        result['proof_type'] = 'dns-rsa'
+        result['proof_type'] = PROOF_TYPE_DNS_RSA
         result['domain'] = domain
         
         # Construct DNS query domain
@@ -299,15 +307,14 @@ class ParallelAROIValidator:
             result['error'] = "Missing URL for uri-rsa proof"
             return result
         
-        # Ensure URL has scheme
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
+        # Normalize URL (ensure it has a scheme)
+        url = self._normalize_url(url)
         
         # Extract base URL (scheme + domain only, no path)
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         
-        result['proof_type'] = 'uri-rsa'
+        result['proof_type'] = PROOF_TYPE_URI_RSA
         result['domain'] = parsed.netloc
         
         # Try multiple URL variations
@@ -362,14 +369,26 @@ class ParallelAROIValidator:
         }
         return fingerprint in valid_fingerprints
     
+    def _normalize_url(self, url: str) -> str:
+        """
+        Ensure URL has a scheme, defaulting to https.
+        
+        Args:
+            url: The URL to normalize
+            
+        Returns:
+            URL with scheme prefix
+        """
+        if not url.startswith(('http://', 'https://')):
+            return 'https://' + url
+        return url
+    
     def _get_ssl_cert_info(self, hostname: str, port: int = 443) -> Dict[str, Any]:
         """
         Fetch SSL certificate details for detailed error messages.
         
         Returns dict with: expiration, issuer_name, hostnames, tls_version, etc.
         """
-        import socket
-        
         try:
             context = ssl.create_default_context()
             context.check_hostname = False
@@ -428,7 +447,7 @@ class ParallelAROIValidator:
                         'hostnames': list(set([cn] + san)) if cn else san,
                         'tls_version': tls_version
                     }
-        except Exception as e:
+        except (socket.error, ssl.SSLError, OSError) as e:
             return {'error': str(e)}
     
     def _fetch_with_retry(self, url: str, max_retries: int = DEFAULT_MAX_RETRIES) -> tuple:
@@ -505,62 +524,67 @@ class ParallelAROIValidator:
         hostname = parsed.netloc
         error_lower = error_str.lower()
         
-        # Try to get certificate info for detailed messages
-        cert_info = self._get_ssl_cert_info(hostname)
+        # Lazy certificate info lookup - only fetch when needed
+        cert_info = None
+        def get_cert_info():
+            nonlocal cert_info
+            if cert_info is None:
+                cert_info = self._get_ssl_cert_info(hostname)
+            return cert_info
         
-        # Connection timeout - include timeout duration and attempt count
+        # Connection timeout - no cert info needed
         if 'timed out' in error_lower or 'timeout' in error_lower:
             return f"Connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url} (attempt {attempt}/{max_attempts})"
         
-        # Connection refused - include attempt count
+        # Connection refused - no cert info needed
         if 'connection refused' in error_lower:
             return f"Connection refused for URL: {url} (attempt {attempt}/{max_attempts})"
         
-        # Certificate expired - include expiration date
-        if 'certificate has expired' in error_lower or 'cert_has_expired' in error_lower:
-            exp_date = cert_info.get('expiration', 'unknown date')
-            return f"SSL certificate expired on {exp_date} for URL: {url}"
-        
-        # Hostname mismatch - include certificate hostnames
-        if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
-            cert_hosts = cert_info.get('hostnames', ['unknown'])
-            cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
-            return f"SSL hostname mismatch: certificate valid for {cert_hosts_str} but URL hostname is {hostname}"
-        
-        # Self-signed certificate in chain - include issuer name
-        if 'self signed certificate in certificate chain' in error_lower:
-            issuer = cert_info.get('issuer_name', 'unknown issuer')
-            return f"SSL certificate chain contains self-signed certificate (issuer: {issuer}) for URL: {url}"
-        
-        # Self-signed certificate - include issuer name
-        if 'self signed certificate' in error_lower or 'self_signed_cert' in error_lower:
-            issuer = cert_info.get('issuer_name', 'unknown issuer')
-            return f"SSL certificate is self-signed (issuer: {issuer}) for URL: {url} - use a trusted CA like Let's Encrypt"
-        
-        # Incomplete chain - include missing issuer info
-        if 'unable to get local issuer' in error_lower:
-            issuer = cert_info.get('issuer_name', 'unknown')
-            return f"SSL certificate chain incomplete for URL: {url} - missing intermediate certificate for issuer: {issuer}"
-        
-        # Unknown CA - include CA name
-        if 'unknown ca' in error_lower or 'unable to get issuer' in error_lower:
-            ca_name = cert_info.get('issuer_name', 'unknown')
-            return f"SSL certificate from unknown CA \"{ca_name}\" for URL: {url} - use a trusted CA like Let's Encrypt"
-        
-        # Certificate verify failed (general)
-        if 'certificate verify failed' in error_lower:
-            return f"SSL certificate verification failed for URL: {url}"
-        
-        # TLS handshake failure - include TLS versions
-        if 'handshake failure' in error_lower or 'handshake_failure' in error_lower:
-            server_tls = cert_info.get('tls_version', 'unknown version')
-            return f"TLS handshake failed for URL: {url} - server offered {server_tls}, minimum required is TLS 1.2"
-        
-        # Connection reset
+        # Connection reset - no cert info needed
         if 'connection reset' in error_lower:
             return f"Connection reset for URL: {url} (attempt {attempt}/{max_attempts})"
         
-        # Generic SSL error
+        # Certificate verify failed (general) - no cert info needed
+        if 'certificate verify failed' in error_lower:
+            return f"SSL certificate verification failed for URL: {url}"
+        
+        # Certificate expired - needs cert info for expiration date
+        if 'certificate has expired' in error_lower or 'cert_has_expired' in error_lower:
+            exp_date = get_cert_info().get('expiration', 'unknown date')
+            return f"SSL certificate expired on {exp_date} for URL: {url}"
+        
+        # Hostname mismatch - needs cert info for hostnames
+        if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
+            cert_hosts = get_cert_info().get('hostnames', ['unknown'])
+            cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
+            return f"SSL hostname mismatch: certificate valid for {cert_hosts_str} but URL hostname is {hostname}"
+        
+        # Self-signed certificate in chain - needs cert info for issuer
+        if 'self signed certificate in certificate chain' in error_lower:
+            issuer = get_cert_info().get('issuer_name', 'unknown issuer')
+            return f"SSL certificate chain contains self-signed certificate (issuer: {issuer}) for URL: {url}"
+        
+        # Self-signed certificate - needs cert info for issuer
+        if 'self signed certificate' in error_lower or 'self_signed_cert' in error_lower:
+            issuer = get_cert_info().get('issuer_name', 'unknown issuer')
+            return f"SSL certificate is self-signed (issuer: {issuer}) for URL: {url} - use a trusted CA like Let's Encrypt"
+        
+        # Incomplete chain - needs cert info for issuer
+        if 'unable to get local issuer' in error_lower:
+            issuer = get_cert_info().get('issuer_name', 'unknown')
+            return f"SSL certificate chain incomplete for URL: {url} - missing intermediate certificate for issuer: {issuer}"
+        
+        # Unknown CA - needs cert info for CA name
+        if 'unknown ca' in error_lower or 'unable to get issuer' in error_lower:
+            ca_name = get_cert_info().get('issuer_name', 'unknown')
+            return f"SSL certificate from unknown CA \"{ca_name}\" for URL: {url} - use a trusted CA like Let's Encrypt"
+        
+        # TLS handshake failure - needs cert info for TLS version
+        if 'handshake failure' in error_lower or 'handshake_failure' in error_lower:
+            server_tls = get_cert_info().get('tls_version', 'unknown version')
+            return f"TLS handshake failed for URL: {url} - server offered {server_tls}, minimum required is TLS 1.2"
+        
+        # Generic SSL error - no cert info needed
         return f"SSL error for URL: {url}: {error_str[:150]}"
     
     def _extract_domain(self, url: str) -> Optional[str]:
@@ -575,9 +599,9 @@ class ParallelAROIValidator:
         """
         if not url or not isinstance(url, str):
             return None
-            
-        if not url.startswith(('http://', 'https://')):
-            url = 'https://' + url
+        
+        # Normalize URL (ensure it has a scheme)
+        url = self._normalize_url(url)
         try:
             parsed = urlparse(url)
             domain = parsed.netloc or parsed.path.split('/')[0]
@@ -700,7 +724,7 @@ def run_validation(
     )
     
     if parallel:
-        print(f"Using parallel validation with {validator.max_workers} workers")
+        logger.info(f"Using parallel validation with {validator.max_workers} workers")
         return validator.validate_parallel(
             limit=limit,
             progress_callback=progress_callback,
@@ -708,7 +732,7 @@ def run_validation(
         )
     
     # Sequential validation
-    print("Using sequential validation")
+    logger.info("Using sequential validation")
     relays = validator.fetch_relay_data(limit)
     results = []
     total = len(relays)
@@ -743,11 +767,11 @@ def calculate_statistics(results: List[Dict]) -> Dict:
             valid_relays += 1
         
         proof_type = r.get('proof_type')
-        if proof_type == 'dns-rsa':
+        if proof_type == PROOF_TYPE_DNS_RSA:
             dns_rsa[0] += 1
             if is_valid:
                 dns_rsa[1] += 1
-        elif proof_type == 'uri-rsa':
+        elif proof_type == PROOF_TYPE_URI_RSA:
             uri_rsa[0] += 1
             if is_valid:
                 uri_rsa[1] += 1
