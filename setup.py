@@ -9,20 +9,28 @@ import sys
 from pathlib import Path
 
 def create_streamlit_config():
-    """Create Streamlit configuration"""
+    """Create Streamlit configuration with 1AEO branding"""
     config_dir = Path(".streamlit")
     config_dir.mkdir(exist_ok=True)
     
     config_content = """[server]
 headless = true
 address = "0.0.0.0"
-port = 5000"""
+port = 5000
+
+[theme]
+primaryColor = "#00ff7f"
+backgroundColor = "#121212"
+secondaryBackgroundColor = "#1e1e1e"
+textColor = "#ffffff"
+font = "sans serif"
+"""
     
     config_file = config_dir / "config.toml"
     with open(config_file, "w") as f:
         f.write(config_content)
     
-    print("✓ Created Streamlit configuration")
+    print("✓ Created Streamlit configuration with 1AEO theme")
 
 def install_dependencies():
     """Install required Python packages"""

@@ -8,6 +8,90 @@ import os
 from datetime import datetime
 
 
+# ============================================================================
+# 1AEO BRANDING (Application Hosting Layer)
+# ============================================================================
+
+def render_1aeo_navigation():
+    """Render 1AEO cross-site navigation bar"""
+    import streamlit as st
+    st.markdown("""
+    <style>
+        .aeo-nav {
+            background-color: #1e1e1e;
+            padding: 12px 20px;
+            margin: -1rem -1rem 1.5rem -1rem;
+            border-bottom: 1px solid rgba(0,255,127,0.2);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        .aeo-nav a { color: #cccccc; text-decoration: none; font-size: 14px; transition: color 0.2s; }
+        .aeo-nav a:hover { color: #00ff7f; }
+        .aeo-nav .brand { color: #00ff7f; font-weight: bold; font-size: 16px; }
+        .aeo-nav .active { color: #00ff7f; font-weight: 500; }
+        .aeo-nav .links { display: flex; gap: 20px; flex-wrap: wrap; }
+    </style>
+    <div class="aeo-nav">
+        <a href="https://www.1aeo.com" class="brand">1AEO</a>
+        <div class="links">
+            <a href="https://www.1aeo.com">Home</a>
+            <a href="https://metrics.1aeo.com">Metrics</a>
+            <a href="https://aroivalidator.1aeo.com" class="active">Validator</a>
+            <a href="https://routefluxmap.1aeo.com">FluxMap</a>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+def render_1aeo_styles():
+    """Render additional 1AEO brand styling"""
+    import streamlit as st
+    st.markdown("""
+    <style>
+        [data-testid="stSidebar"] { border-right: 1px solid rgba(0,255,127,0.2); }
+        [data-testid="stMetric"] {
+            background-color: #1e1e1e;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid rgba(0,255,127,0.1);
+        }
+        .stButton > button:hover {
+            border-color: #00ff7f;
+            box-shadow: 0 0 10px rgba(0,255,127,0.3);
+        }
+        [data-testid="stDataFrame"] {
+            border: 1px solid rgba(0,255,127,0.1);
+            border-radius: 8px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def render_1aeo_footer():
+    """Render 1AEO footer with cross-site links"""
+    import streamlit as st
+    st.markdown("""
+    <div style="margin-top: 3rem; padding-top: 1.5rem; border-top: 1px solid rgba(0,255,127,0.2); text-align: center; color: #888;">
+        <div style="margin-bottom: 10px;">
+            <a href="https://metrics.1aeo.com" style="color: #00ff7f; margin: 0 10px;">Metrics</a> |
+            <a href="https://aroivalidator.1aeo.com" style="color: #00ff7f; margin: 0 10px;">Validator</a> |
+            <a href="https://routefluxmap.1aeo.com" style="color: #00ff7f; margin: 0 10px;">FluxMap</a>
+        </div>
+        <p style="font-size: 12px; margin: 0;">
+            <a href="https://www.1aeo.com" style="color: #00ff7f;">1AEO</a> · 
+            <a href="https://github.com/1aeo" style="color: #888;">GitHub</a>
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
 def _results_to_dataframe(results: list, include_error: bool = False):
     """
     Convert validation results to a pandas DataFrame.
@@ -54,6 +138,10 @@ def interactive_mode():
         layout="wide",
         initial_sidebar_state="expanded"
     )
+    
+    # 1AEO Branding
+    render_1aeo_navigation()
+    render_1aeo_styles()
     
     # Initialize session state
     if 'validation_results' not in st.session_state:
@@ -228,6 +316,9 @@ def interactive_mode():
         display_results()
     else:
         st.info("👆 Click 'Start Validation' to begin. Parallel processing is enabled by default for faster validation!")
+    
+    # 1AEO Footer
+    render_1aeo_footer()
 
 
 def viewer_mode():
@@ -240,6 +331,10 @@ def viewer_mode():
         page_icon="📊",
         layout="wide"
     )
+    
+    # 1AEO Branding
+    render_1aeo_navigation()
+    render_1aeo_styles()
     
     st.title("📊 AROI Validation Results Viewer")
     
@@ -277,6 +372,9 @@ def viewer_mode():
     st.subheader("Detailed Results")
     df = _results_to_dataframe(data.get('results', []), include_error=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
+    
+    # 1AEO Footer
+    render_1aeo_footer()
 
 
 def _get_validated_env_int(name: str, default: int, min_val: int, max_val: int) -> int:
@@ -321,6 +419,9 @@ def batch_mode():
     limit = _get_validated_env_int('BATCH_LIMIT', default=100, min_val=0, max_val=50000)
     max_workers = _get_validated_env_int('MAX_WORKERS', default=10, min_val=1, max_val=100)
     
+    # Convert 0 to None for "all relays" (consistent with interactive mode)
+    effective_limit = None if limit == 0 else limit
+    
     parallel_str = os.environ.get('PARALLEL', 'true').lower()
     use_parallel = parallel_str in ('true', '1', 'yes', 'on')
     
@@ -335,7 +436,7 @@ def batch_mode():
     # Run validation
     results = run_validation(
         progress_callback=progress_callback,
-        limit=limit,
+        limit=effective_limit,
         parallel=use_parallel,
         max_workers=max_workers
     )
