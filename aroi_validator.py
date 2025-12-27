@@ -3,27 +3,25 @@ AROI Validator with Parallel Processing Support
 Simplified and optimized version with parallel validation capability
 """
 import concurrent.futures
-import time
-import requests
 import json
-import base64
-import re
-import dns.resolver
-import dns.dnssec
-import dns.rdatatype
-import ssl
-import urllib3
 import logging
-from typing import Dict, Any, List, Optional, Callable
-from urllib.parse import urlparse, urljoin
-from datetime import datetime
+import re
+import ssl
+import string
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Dict, Any, List, Optional, Callable
+from urllib.parse import urlparse
+
+import dns.resolver
+import requests
 
 # Configure logging for security events
 logger = logging.getLogger(__name__)
 
-# Note: SSL warnings are intentionally NOT disabled globally.
-# Legacy TLS connections will log warnings when used.
+# Pre-computed constants for filename validation
+_ALLOWED_FILENAME_CHARS = frozenset(string.ascii_letters + string.digits + '._-')
+_MAX_WORKERS_LIMIT = 100
 
 
 class SecureTLSAdapter(requests.adapters.HTTPAdapter):
@@ -49,25 +47,20 @@ class SecureTLSAdapter(requests.adapters.HTTPAdapter):
     def init_poolmanager(self, *args, **kwargs):
         ctx = ssl.create_default_context()
         
+        # Always use TLS 1.2 as minimum (TLS 1.0/1.1 are deprecated)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        
         if self.verify_certificates:
-            # Secure mode: verify certificates and hostnames
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
         else:
-            # Legacy mode: disable verification (logged as warning)
             logger.warning("SSL certificate verification disabled - vulnerable to MITM attacks")
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
         
         if self.allow_legacy_tls:
-            # Allow TLS 1.2 as minimum (TLS 1.0/1.1 are deprecated and insecure)
-            # Even in legacy mode, we use TLS 1.2 as the minimum secure version
             logger.warning("Legacy TLS mode enabled - using relaxed cipher settings")
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             ctx.set_ciphers('DEFAULT@SECLEVEL=1')
-        else:
-            # Modern secure mode: TLS 1.2+ with strong ciphers
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         
         kwargs['ssl_context'] = ctx
         return super().init_poolmanager(*args, **kwargs)
@@ -96,12 +89,12 @@ class ParallelAROIValidator:
         a known trade-off for this specific use case. The validator only fetches public
         proof files, not sensitive data.
         """
-        # Validate max_workers to prevent resource exhaustion
+        # Validate and cap max_workers to prevent resource exhaustion
         if not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
-        if max_workers > 100:
-            logger.warning(f"max_workers={max_workers} is very high, limiting to 100")
-            max_workers = 100
+        if max_workers > _MAX_WORKERS_LIMIT:
+            logger.warning(f"max_workers={max_workers} exceeds limit, capping to {_MAX_WORKERS_LIMIT}")
+            max_workers = _MAX_WORKERS_LIMIT
         
         self.max_workers = max_workers
         self.verify_certificates = verify_certificates
@@ -151,12 +144,8 @@ class ParallelAROIValidator:
         Workaround for Onionoo API bug where relays offline for over a year are returned
         despite documentation stating only relays from the past week are included.
         """
-        from datetime import datetime, timedelta
-        
+        cutoff_date = datetime.utcnow() - timedelta(days=14)
         active_relays = []
-        now = datetime.utcnow()
-        max_offline_days = 14
-        cutoff_date = now - timedelta(days=max_offline_days)
         
         for relay in relays:
             # If relay is running, include it
@@ -348,17 +337,14 @@ class ParallelAROIValidator:
         return result
     
     def _check_fingerprint_in_response(self, text: str, fingerprint: str) -> bool:
-        """Check if fingerprint exists in response text"""
-        lines = text.strip().split('\n')
-        for line in lines:
-            line = line.strip()
-            # Skip comments and empty lines
-            if line.startswith('#') or not line:
-                continue
-            # Check if this line contains the fingerprint (case-insensitive)
-            if fingerprint == line.upper():
-                return True
-        return False
+        """Check if fingerprint exists in response text using O(1) set lookup."""
+        # Build set of valid fingerprints (excluding comments and empty lines)
+        valid_fingerprints = {
+            line.strip().upper()
+            for line in text.split('\n')
+            if line.strip() and not line.strip().startswith('#')
+        }
+        return fingerprint in valid_fingerprints
     
     def _extract_domain(self, url: str) -> Optional[str]:
         """
@@ -475,33 +461,21 @@ def run_validation(
     allow_legacy_tls: bool = True
 ) -> List[Dict[str, Any]]:
     """
-    Run AROI validation with optional parallel processing
+    Run AROI validation with optional parallel processing.
     
     Args:
         progress_callback: Function to call with (current, total, result)
         stop_check: Function that returns True if validation should stop
-        limit: Maximum number of relays to validate (None for all, must be positive if set)
+        limit: Maximum relays to validate (None for all)
         parallel: Whether to use parallel processing
-        max_workers: Number of parallel workers (if parallel=True), must be 1-100
+        max_workers: Number of parallel workers (1-100, validated by ParallelAROIValidator)
         verify_certificates: Whether to verify SSL certificates
         allow_legacy_tls: Whether to allow legacy TLS settings
     
     Returns:
         List of validation results
-        
-    Raises:
-        ValueError: If parameters are invalid
     """
-    # Validate inputs
-    if limit is not None:
-        if not isinstance(limit, int) or limit < 0:
-            raise ValueError("limit must be a non-negative integer or None")
-    
-    if not isinstance(max_workers, int) or max_workers < 1:
-        raise ValueError("max_workers must be a positive integer")
-    
-    max_workers = min(max_workers, 100)  # Cap at 100 workers
-    
+    # ParallelAROIValidator handles max_workers validation and capping
     validator = ParallelAROIValidator(
         max_workers=max_workers if parallel else 1,
         verify_certificates=verify_certificates,
@@ -509,61 +483,81 @@ def run_validation(
     )
     
     if parallel:
-        print(f"Using parallel validation with {max_workers} workers")
+        print(f"Using parallel validation with {validator.max_workers} workers")
         return validator.validate_parallel(
             limit=limit,
             progress_callback=progress_callback,
             stop_check=stop_check
         )
-    else:
-        print("Using sequential validation")
-        # Sequential validation (backwards compatible)
-        relays = validator.fetch_relay_data(limit)
-        results = []
+    
+    # Sequential validation
+    print("Using sequential validation")
+    relays = validator.fetch_relay_data(limit)
+    results = []
+    total = len(relays)
+    
+    for idx, relay in enumerate(relays, 1):
+        if stop_check and stop_check():
+            break
         
-        for idx, relay in enumerate(relays):
-            if stop_check and stop_check():
-                break
-            
-            result = validator.validate_relay(relay)
-            results.append(result)
-            
-            if progress_callback:
-                progress_callback(idx + 1, len(relays), result)
+        result = validator.validate_relay(relay)
+        results.append(result)
         
-        return results
+        if progress_callback:
+            progress_callback(idx, total, result)
+    
+    return results
 
 
 def calculate_statistics(results: List[Dict]) -> Dict:
-    """Calculate validation statistics"""
+    """Calculate validation statistics in a single pass through results."""
     total_relays = len(results)
-    valid_relays = sum(1 for r in results if r['valid'])
-    invalid_relays = total_relays - valid_relays
-    success_rate = (valid_relays / total_relays * 100) if total_relays > 0 else 0
+    valid_relays = 0
     
-    # Proof type analysis
-    dns_rsa_results = [r for r in results if r.get('proof_type') == 'dns-rsa']
-    uri_rsa_results = [r for r in results if r.get('proof_type') == 'uri-rsa']
-    no_proof_results = [r for r in results if not r.get('proof_type')]
+    # Counters for proof types: [total, valid]
+    dns_rsa = [0, 0]
+    uri_rsa = [0, 0]
+    no_proof = 0
+    
+    # Single pass through results
+    for r in results:
+        is_valid = r.get('valid', False)
+        if is_valid:
+            valid_relays += 1
+        
+        proof_type = r.get('proof_type')
+        if proof_type == 'dns-rsa':
+            dns_rsa[0] += 1
+            if is_valid:
+                dns_rsa[1] += 1
+        elif proof_type == 'uri-rsa':
+            uri_rsa[0] += 1
+            if is_valid:
+                uri_rsa[1] += 1
+        else:
+            no_proof += 1
+    
+    def calc_rate(valid: int, total: int) -> float:
+        return (valid / total * 100) if total > 0 else 0.0
     
     return {
         'total_relays': total_relays,
         'valid_relays': valid_relays,
-        'invalid_relays': invalid_relays,
-        'success_rate': success_rate,
+        'invalid_relays': total_relays - valid_relays,
+        'success_rate': calc_rate(valid_relays, total_relays),
         'proof_types': {
             'dns_rsa': {
-                'total': len(dns_rsa_results),
-                'valid': sum(1 for r in dns_rsa_results if r['valid']),
-                'success_rate': (sum(1 for r in dns_rsa_results if r['valid']) / len(dns_rsa_results) * 100) if dns_rsa_results else 0
+                'total': dns_rsa[0],
+                'valid': dns_rsa[1],
+                'success_rate': calc_rate(dns_rsa[1], dns_rsa[0])
             },
             'uri_rsa': {
-                'total': len(uri_rsa_results),
-                'valid': sum(1 for r in uri_rsa_results if r['valid']),
-                'success_rate': (sum(1 for r in uri_rsa_results if r['valid']) / len(uri_rsa_results) * 100) if uri_rsa_results else 0
+                'total': uri_rsa[0],
+                'valid': uri_rsa[1],
+                'success_rate': calc_rate(uri_rsa[1], uri_rsa[0])
             },
             'no_proof': {
-                'total': len(no_proof_results)
+                'total': no_proof
             }
         }
     }
@@ -587,19 +581,17 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     results_dir = Path('validation_results').resolve()
     results_dir.mkdir(exist_ok=True)
     
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    
     if filename is None:
-        filename = f'aroi_validation_{timestamp}.json'
+        filename = f"aroi_validation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     else:
-        # Sanitize user-provided filename
         filename = _sanitize_filename(filename)
     
     statistics = calculate_statistics(results)
+    timestamp = datetime.now().isoformat()
     
     output_data = {
         'metadata': {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': timestamp,
             'total_relays': statistics['total_relays'],
             'valid_relays': statistics['valid_relays'],
             'invalid_relays': statistics['invalid_relays'],
@@ -609,20 +601,12 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
         'results': results
     }
     
-    # Save with timestamp
+    # Write to both timestamped file and latest.json
     file_path = results_dir / filename
+    json_content = json.dumps(output_data, indent=2)
     
-    # Verify the path is within the results directory (defense in depth)
-    if not str(file_path.resolve()).startswith(str(results_dir)):
-        raise ValueError("Invalid filename: path traversal detected")
-    
-    with open(file_path, 'w') as f:
-        json.dump(output_data, f, indent=2)
-    
-    # Also save as latest
-    latest_path = results_dir / 'latest.json'
-    with open(latest_path, 'w') as f:
-        json.dump(output_data, f, indent=2)
+    file_path.write_text(json_content)
+    (results_dir / 'latest.json').write_text(json_content)
     
     return file_path
 
@@ -646,23 +630,16 @@ def _sanitize_filename(filename: str) -> str:
     # Get only the base name to prevent path traversal
     safe_name = Path(filename).name
     
-    # Ensure no path separators remain
-    if '/' in safe_name or '\\' in safe_name:
-        raise ValueError("Invalid filename: contains path separators")
-    
-    # Reject names that start with dots (hidden files) except for specific allowed names
-    if safe_name.startswith('.') and safe_name not in ['.json']:
-        raise ValueError("Invalid filename: hidden files not allowed")
-    
-    # Validate the filename contains only safe characters
-    import string
-    allowed_chars = set(string.ascii_letters + string.digits + '._-')
-    if not all(c in allowed_chars for c in safe_name):
-        raise ValueError("Invalid filename: contains invalid characters")
-    
-    # Ensure it ends with .json
+    # Validate constraints
     if not safe_name.endswith('.json'):
         raise ValueError("Invalid filename: must end with .json")
+    
+    if safe_name.startswith('.'):
+        raise ValueError("Invalid filename: hidden files not allowed")
+    
+    # Use pre-computed frozenset for O(1) character validation
+    if not all(c in _ALLOWED_FILENAME_CHARS for c in safe_name):
+        raise ValueError("Invalid filename: contains invalid characters")
     
     return safe_name
 
@@ -680,31 +657,19 @@ def load_results(filename: str = 'latest.json') -> Optional[Dict]:
     Security:
         Filename is sanitized to prevent path traversal attacks.
     """
-    results_dir = Path('validation_results').resolve()
-    
     try:
         safe_filename = _sanitize_filename(filename)
     except ValueError as e:
         logger.warning(f"Invalid filename rejected: {filename} - {e}")
         return None
     
-    file_path = results_dir / safe_filename
-    
-    # Double-check that the resolved path is within the results directory
-    try:
-        file_path = file_path.resolve()
-        if not str(file_path).startswith(str(results_dir)):
-            logger.warning(f"Path traversal attempt detected: {filename}")
-            return None
-    except (OSError, ValueError):
-        return None
+    file_path = Path('validation_results').resolve() / safe_filename
     
     if not file_path.exists():
         return None
     
     try:
-        with open(file_path, 'r') as f:
-            return json.load(f)
+        return json.loads(file_path.read_text())
     except json.JSONDecodeError as e:
         logger.error(f"Invalid JSON in {safe_filename}: {e}")
         return None

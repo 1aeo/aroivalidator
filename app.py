@@ -6,13 +6,43 @@ import sys
 import json
 import os
 from datetime import datetime
-from pathlib import Path
+
+
+def _results_to_dataframe(results: list, include_error: bool = False):
+    """
+    Convert validation results to a pandas DataFrame.
+    
+    Args:
+        results: List of validation result dictionaries
+        include_error: Whether to include the error column
+        
+    Returns:
+        pandas DataFrame with formatted results
+    """
+    import pandas as pd
+    
+    columns = ['Nickname', 'Fingerprint', 'Valid', 'Proof Type', 'Domain']
+    if include_error:
+        columns.append('Error')
+    
+    df_data = [
+        {
+            'Nickname': r.get('nickname', 'Unknown'),
+            'Fingerprint': r.get('fingerprint', ''),
+            'Valid': '✅' if r.get('valid') else '❌',
+            'Proof Type': r.get('proof_type') or 'None',
+            'Domain': r.get('domain') or 'N/A',
+            **(({'Error': r.get('error') or ''}) if include_error else {})
+        }
+        for r in results
+    ]
+    
+    return pd.DataFrame(df_data, columns=columns)
 
 
 def interactive_mode():
     """Interactive validation mode with Streamlit UI"""
     import streamlit as st
-    import pandas as pd
     from aroi_validator import (
         run_validation, calculate_statistics, save_results,
         load_results, list_result_files
@@ -126,18 +156,7 @@ def interactive_mode():
         
         # Results table
         st.subheader("📋 Detailed Results")
-        df_data = []
-        for result in results:
-            df_data.append({
-                'Nickname': result.get('nickname', 'Unknown'),
-                'Fingerprint': result.get('fingerprint', ''),
-                'Valid': '✅' if result['valid'] else '❌',
-                'Proof Type': result.get('proof_type', 'None'),
-                'Domain': result.get('domain', 'N/A'),
-                'Error': result.get('error', '') if result.get('error') else ''
-            })
-        
-        df = pd.DataFrame(df_data)
+        df = _results_to_dataframe(results, include_error=True)
         st.dataframe(df, use_container_width=True, hide_index=True)
     
     # Header
@@ -214,7 +233,6 @@ def interactive_mode():
 def viewer_mode():
     """View saved validation results"""
     import streamlit as st
-    import pandas as pd
     from aroi_validator import load_results, list_result_files
     
     st.set_page_config(
@@ -257,19 +275,7 @@ def viewer_mode():
     
     # Results table
     st.subheader("Detailed Results")
-    results = data.get('results', [])
-    
-    df_data = []
-    for result in results:
-        df_data.append({
-            'Nickname': result.get('nickname', 'Unknown'),
-            'Fingerprint': result.get('fingerprint', ''),
-            'Valid': '✅' if result['valid'] else '❌',
-            'Proof Type': result.get('proof_type', 'None'),
-            'Domain': result.get('domain', 'N/A')
-        })
-    
-    df = pd.DataFrame(df_data)
+    df = _results_to_dataframe(data.get('results', []), include_error=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 
