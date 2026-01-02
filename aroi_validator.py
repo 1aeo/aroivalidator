@@ -9,6 +9,7 @@ import re
 import socket
 import ssl
 import string
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Callable
@@ -32,12 +33,16 @@ _MAX_WORKERS_LIMIT = 100
 # Default configuration constants (DRY - single source of truth)
 DEFAULT_VERIFY_CERTIFICATES = True
 DEFAULT_ALLOW_LEGACY_TLS = True
-DEFAULT_MAX_RETRIES = 1  # Retry once on timeout/connection refused
-DEFAULT_TIMEOUT_SECONDS = 10
+DEFAULT_MAX_RETRIES = 0  # No per-request retries - domain gets multiple attempts via cache
+DEFAULT_TIMEOUT_SECONDS = 5  # 5s timeout per attempt
+DEFAULT_DOMAIN_MAX_ATTEMPTS = 3  # Reduced from 10: 3 consecutive failures is enough to mark domain bad
 
 # Proof type constants (DRY - avoid magic strings)
 PROOF_TYPE_DNS_RSA = "dns-rsa"
 PROOF_TYPE_URI_RSA = "uri-rsa"
+
+# Connectivity error indicators (DRY - used for cache decisions)
+_CONNECTIVITY_ERROR_PATTERNS = ('timed out', 'connection refused', 'connection reset', 'connection error')
 
 # Pre-compiled regex patterns for AROI field parsing (efficiency)
 _AROI_PATTERNS = {
@@ -98,7 +103,7 @@ class ParallelAROIValidator:
     
     def __init__(
         self, 
-        max_workers: int = 10,
+        max_workers: int = 20,
         verify_certificates: bool = DEFAULT_VERIFY_CERTIFICATES,
         allow_legacy_tls: bool = DEFAULT_ALLOW_LEGACY_TLS
     ):
@@ -138,6 +143,108 @@ class ParallelAROIValidator:
         )
         self.session.mount('https://', tls_adapter)
         self.session.mount('http://', tls_adapter)
+        
+        # Thread-safe domain status cache with attempt tracking
+        # Maps domain -> {'status': str, 'data': str|None, 'attempts': int, 'fingerprints': set|None}
+        #   status='pending': one thread is testing, others wait
+        #   status='retry': previous attempt failed, but attempts remain - next thread should try
+        #   status='failed': all attempts exhausted, data=error message
+        #   status='success': domain reachable, data=response text, fingerprints=parsed set
+        self._domain_cache: Dict[str, Dict] = {}
+        self._domain_cache_lock = threading.Lock()
+        self._domain_conditions: Dict[str, threading.Condition] = {}
+        self._domain_max_attempts = DEFAULT_DOMAIN_MAX_ATTEMPTS
+    
+    def _get_domain_status(self, domain: str) -> tuple:
+        """
+        Get domain status from cache, waiting if another thread is testing it.
+        
+        Returns:
+            (status, data) tuple:
+            - ('should_test', None): Caller should test this domain
+            - ('failed', error_msg): Domain failed all attempts, use cached error
+            - ('success', response_text): Domain succeeded, use cached response
+        """
+        with self._domain_cache_lock:
+            if domain not in self._domain_cache:
+                # First thread to test this domain - mark as pending
+                self._domain_cache[domain] = {'status': 'pending', 'data': None, 'attempts': 0}
+                self._domain_conditions[domain] = threading.Condition(self._domain_cache_lock)
+                return ('should_test', None)
+            
+            cache_entry = self._domain_cache[domain]
+            status = cache_entry['status']
+            
+            if status == 'pending':
+                # Another thread is testing - wait for result (with timeout)
+                condition = self._domain_conditions[domain]
+                # Wait slightly longer than the network timeout to give tester a chance
+                wait_success = condition.wait(timeout=DEFAULT_TIMEOUT_SECONDS + 1.0)
+                
+                if not wait_success:
+                    # Timed out waiting for other thread - take over as tester
+                    # This prevents one stuck thread from blocking everyone
+                    logger.warning(f"Timeout waiting for domain check: {domain} - taking over")
+                    self._domain_cache[domain]['status'] = 'pending'
+                    return ('should_test', None)
+                
+                # Re-check status after waking
+                cache_entry = self._domain_cache[domain]
+                status = cache_entry['status']
+                
+                # If still pending (spurious wake or race), try testing ourselves
+                if status == 'pending':
+                     return ('should_test', None)
+            
+            if status == 'retry':
+                # Previous attempt failed but we have attempts left - this thread should try
+                self._domain_cache[domain]['status'] = 'pending'
+                return ('should_test', None)
+            
+            # Return final status (success or failed)
+            return (status, cache_entry['data'])
+    
+    def _set_domain_result(self, domain: str, success: bool, data: Optional[str]) -> None:
+        """
+        Record result of a domain test attempt.
+        
+        Args:
+            domain: The domain that was tested
+            success: Whether the request succeeded
+            data: Response text (if success) or error message (if failure)
+        """
+        with self._domain_cache_lock:
+            cache_entry = self._domain_cache.get(domain, {'attempts': 0})
+            cache_entry['attempts'] += 1
+            
+            if success:
+                cache_entry['status'] = 'success'
+                cache_entry['data'] = data
+                # Pre-parse fingerprint set for O(1) lookups (avoids re-parsing for each relay)
+                cache_entry['fingerprints'] = self._parse_fingerprint_list(data) if data else set()
+                logger.info(f"Domain cached as reachable: {domain}")
+            elif cache_entry['attempts'] >= self._domain_max_attempts:
+                # Exhausted all attempts
+                cache_entry['status'] = 'failed'
+                cache_entry['data'] = f"{data} (after {cache_entry['attempts']} attempts)"
+                logger.info(f"Domain cached as unreachable after {cache_entry['attempts']} attempts: {domain}")
+            else:
+                # Still have attempts left - mark as retry so next thread tries
+                cache_entry['status'] = 'retry'
+                cache_entry['data'] = data
+                logger.debug(f"Domain attempt {cache_entry['attempts']}/{self._domain_max_attempts} failed: {domain}")
+            
+            self._domain_cache[domain] = cache_entry
+            
+            # Wake up waiting threads
+            if domain in self._domain_conditions:
+                self._domain_conditions[domain].notify_all()
+    
+    def clear_domain_cache(self) -> None:
+        """Clear the domain cache (call before each validation run)."""
+        with self._domain_cache_lock:
+            self._domain_cache.clear()
+            self._domain_conditions.clear()
         
     def fetch_relay_data(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
         """
@@ -265,6 +372,15 @@ class ParallelAROIValidator:
         result['proof_type'] = PROOF_TYPE_DNS_RSA
         result['domain'] = domain
         
+        # Check domain cache status
+        status, data = self._get_domain_status(domain)
+        
+        if status == 'failed':
+            result['error'] = f"Domain unreachable (cached): {data}"
+            return result
+        # Note: DNS-RSA doesn't benefit from 'success' caching since each relay
+        # has a unique subdomain query. We still check for 'failed' to skip dead domains.
+        
         # Construct DNS query domain
         fingerprint = relay['fingerprint'].lower()
         query_domain = f"{fingerprint}.{domain}"
@@ -273,6 +389,9 @@ class ParallelAROIValidator:
         try:
             answers = dns.resolver.resolve(query_domain, 'TXT')
             txt_records = [str(rdata).strip('"') for rdata in answers]
+            
+            # DNS worked - mark domain as reachable (cache empty response, just marks as success)
+            self._set_domain_result(domain, success=True, data="")
             
             # Validate proof
             if self._validate_proof_content(txt_records, relay['fingerprint']):
@@ -286,6 +405,14 @@ class ParallelAROIValidator:
                 # Show actual content found
                 found_content = '; '.join(txt_records)[:100] if txt_records else 'empty'
                 result['error'] = f"Invalid proof content in DNS TXT record: expected 'we-run-this-tor-relay', found: {found_content}"
+        except (dns.resolver.Timeout, dns.resolver.NoNameservers) as e:
+            # Record DNS timeout/unreachable (counts toward domain's attempt limit)
+            error_msg = f"DNS lookup failed: {str(e)}"
+            self._set_domain_result(domain, success=False, data=error_msg)
+            result['error'] = error_msg
+        except dns.resolver.NXDOMAIN:
+            # NXDOMAIN is expected for relays not in the list - don't count against domain
+            result['error'] = f"DNS record not found: {query_domain}"
         except Exception as e:
             result['error'] = f"DNS lookup failed: {str(e)}"
         
@@ -304,61 +431,105 @@ class ParallelAROIValidator:
         # Extract base URL (scheme + domain only, no path)
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
+        domain = parsed.netloc
         
         result['proof_type'] = PROOF_TYPE_URI_RSA
-        result['domain'] = parsed.netloc
-        
-        # Try multiple URL variations
-        urls_to_try = []
-        
-        # Original URL
-        urls_to_try.append(f"{base_url}/.well-known/tor-relay/rsa-fingerprint.txt")
-        
-        # Try with www prefix if not already present
-        if not parsed.netloc.startswith('www.'):
-            www_base = f"{parsed.scheme}://www.{parsed.netloc}"
-            urls_to_try.append(f"{www_base}/.well-known/tor-relay/rsa-fingerprint.txt")
+        result['domain'] = domain
         
         fingerprint = relay['fingerprint'].upper()
-        all_errors = []
         
-        for proof_url in urls_to_try:
-            # Use fetch with retry for transient failures
-            response, error, attempts = self._fetch_with_retry(proof_url)
+        # Check domain cache - this will wait if another thread is testing
+        status, data = self._get_domain_status(domain)
+        
+        if status == 'failed':
+            result['error'] = f"Domain unreachable (cached): {data}"
+            return result
+        elif status == 'success':
+            # Domain succeeded before - use cached fingerprint set for O(1) lookup
+            with self._domain_cache_lock:
+                cached_fingerprints = self._domain_cache[domain].get('fingerprints', set())
+            
+            if fingerprint in cached_fingerprints:
+                result['valid'] = True
+                result['validation_steps'].append({
+                    'step': 'URI proof fetch (cached)',
+                    'success': True,
+                    'details': f"Found fingerprint in cached response for {domain}"
+                })
+                return result
+            else:
+                result['error'] = f"Fingerprint not found: fingerprint {fingerprint} not listed at {domain}"
+                return result
+        
+        # status == 'should_test': We should test this domain
+        # Try the primary URL first
+        primary_url = f"{base_url}/.well-known/tor-relay/rsa-fingerprint.txt"
+        response, error, attempts = self._fetch_with_retry(primary_url)
+        
+        if response:
+            # Success! Cache the response for other relays using this domain
+            self._set_domain_result(domain, success=True, data=response.text)
+            
+            # Optimization: Use the cached fingerprint set we just created
+            with self._domain_cache_lock:
+                cached_fingerprints = self._domain_cache[domain].get('fingerprints', set())
+            
+            if fingerprint in cached_fingerprints:
+                result['valid'] = True
+                result['validation_steps'].append({
+                    'step': 'URI proof fetch',
+                    'success': True,
+                    'details': f"Found fingerprint in {primary_url}"
+                })
+                return result
+            else:
+                result['error'] = f"Fingerprint not found in URL: fingerprint {fingerprint} not listed at {primary_url}"
+                return result
+        
+        all_errors = [error]
+        
+        # Only try www variant if primary failed with HTTP error (not timeout/connection error)
+        # If the domain itself is unreachable, www variant won't help
+        is_connectivity_error = any(p in error.lower() for p in _CONNECTIVITY_ERROR_PATTERNS)
+        
+        if not is_connectivity_error and not parsed.netloc.startswith('www.'):
+            www_url = f"{parsed.scheme}://www.{parsed.netloc}/.well-known/tor-relay/rsa-fingerprint.txt"
+            response, error, attempts = self._fetch_with_retry(www_url)
             
             if response:
-                # Check if fingerprint is listed in the file
-                if self._check_fingerprint_in_response(response.text, fingerprint):
+                self._set_domain_result(domain, success=True, data=response.text)
+                
+                # Optimization: Use the cached fingerprint set we just created
+                with self._domain_cache_lock:
+                    cached_fingerprints = self._domain_cache[domain].get('fingerprints', set())
+                
+                if fingerprint in cached_fingerprints:
                     result['valid'] = True
                     result['validation_steps'].append({
                         'step': 'URI proof fetch',
                         'success': True,
-                        'details': f"Found fingerprint in {proof_url}"
+                        'details': f"Found fingerprint in {www_url}"
                     })
                     return result
                 else:
-                    all_errors.append(f"Fingerprint not found in URL: fingerprint {fingerprint} not listed at {proof_url}")
+                    result['error'] = f"Fingerprint not found in URL: fingerprint {fingerprint} not listed at {www_url}"
+                    return result
             else:
                 all_errors.append(error)
         
-        # If we get here, all attempts failed - show all errors
-        if len(all_errors) > 1:
-            result['error'] = "; ".join(all_errors)
-        elif all_errors:
-            result['error'] = all_errors[0]
-        else:
-            result['error'] = "Failed to fetch URI proof"
+        # All URL variations failed - record this attempt (may allow more attempts)
+        error_msg = "; ".join(all_errors) if all_errors else "Failed to fetch URI proof"
+        self._set_domain_result(domain, success=False, data=all_errors[0] if all_errors else error_msg)
+        result['error'] = error_msg
         return result
     
-    def _check_fingerprint_in_response(self, text: str, fingerprint: str) -> bool:
-        """Check if fingerprint exists in response text using O(1) set lookup."""
-        # Build set of valid fingerprints (excluding comments and empty lines)
-        valid_fingerprints = {
+    def _parse_fingerprint_list(self, text: str) -> set:
+        """Parse fingerprint list from response text into a set for O(1) lookups."""
+        return {
             line.strip().upper()
             for line in text.split('\n')
             if line.strip() and not line.strip().startswith('#')
         }
-        return fingerprint in valid_fingerprints
     
     def _normalize_url(self, url: str) -> str:
         """
@@ -374,6 +545,21 @@ class ParallelAROIValidator:
             return 'https://' + url
         return url
     
+    @staticmethod
+    def _parse_cert_field(field_data: list) -> Dict[str, str]:
+        """Parse certificate field (issuer/subject) into a flat dict. DRY helper."""
+        result = {}
+        for item in field_data:
+            if isinstance(item, tuple):
+                # Handle both ((key, val),) and (key, val) formats
+                if len(item) == 2 and isinstance(item[0], str):
+                    result[item[0]] = item[1]
+                else:
+                    for subitem in item:
+                        if isinstance(subitem, tuple) and len(subitem) == 2:
+                            result[subitem[0]] = subitem[1]
+        return result
+    
     def _get_ssl_cert_info(self, hostname: str, port: int = 443) -> Dict[str, Any]:
         """
         Fetch SSL certificate details for detailed error messages.
@@ -388,51 +574,30 @@ class ParallelAROIValidator:
             with socket.create_connection((hostname, port), timeout=5) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                     cert = ssock.getpeercert(binary_form=False)
-                    tls_version = ssock.version()  # e.g., 'TLSv1.2', 'TLSv1.3'
+                    tls_version = ssock.version()
                     
                     if not cert:
                         return {'tls_version': tls_version}
                     
-                    # Expiration date
+                    # Parse expiration date
                     not_after = cert.get('notAfter', '')
                     try:
-                        exp_date = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z')
-                        exp_str = exp_date.strftime('%Y-%m-%d')
+                        exp_str = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z').strftime('%Y-%m-%d')
                     except (ValueError, TypeError):
                         exp_str = not_after
                     
-                    # Issuer information
-                    issuer = cert.get('issuer', [])
-                    issuer_dict = {}
-                    for item in issuer:
-                        if isinstance(item, tuple) and len(item) == 2:
-                            issuer_dict[item[0]] = item[1]
-                        elif isinstance(item, tuple):
-                            for subitem in item:
-                                if isinstance(subitem, tuple) and len(subitem) == 2:
-                                    issuer_dict[subitem[0]] = subitem[1]
+                    # Parse issuer and subject using shared helper
+                    issuer = self._parse_cert_field(cert.get('issuer', []))
+                    subject = self._parse_cert_field(cert.get('subject', []))
                     
-                    issuer_cn = issuer_dict.get('commonName', '')
-                    issuer_org = issuer_dict.get('organizationName', '')
-                    issuer_name = issuer_cn or issuer_org or 'Unknown'
-                    
-                    # Subject hostnames
-                    subject = cert.get('subject', [])
-                    subject_dict = {}
-                    for item in subject:
-                        if isinstance(item, tuple):
-                            for subitem in item:
-                                if isinstance(subitem, tuple) and len(subitem) == 2:
-                                    subject_dict[subitem[0]] = subitem[1]
-                    
-                    cn = subject_dict.get('commonName', '')
+                    issuer_cn = issuer.get('commonName', '')
+                    issuer_org = issuer.get('organizationName', '')
+                    cn = subject.get('commonName', '')
                     san = [x[1] for x in cert.get('subjectAltName', []) if x[0] == 'DNS']
                     
                     return {
                         'expiration': exp_str,
-                        'issuer_name': issuer_name,
-                        'issuer_cn': issuer_cn,
-                        'issuer_org': issuer_org,
+                        'issuer_name': issuer_cn or issuer_org or 'Unknown',
                         'common_name': cn,
                         'subject_alt_names': san,
                         'hostnames': list(set([cn] + san)) if cn else san,
@@ -515,31 +680,29 @@ class ParallelAROIValidator:
                 cert_info_cache['data'] = self._get_ssl_cert_info(hostname)
             return cert_info_cache['data']
         
-        # Table-driven error pattern matching: (patterns, needs_cert, template_func)
-        # Each entry: (list of patterns to match, whether cert info needed, message formatter)
+        # Table-driven error pattern matching: (patterns, message_func)
         error_patterns = [
-            # Connection errors (no cert info needed)
-            (['timed out', 'timeout'], False,
+            # Connection errors
+            (['timed out', 'timeout'],
              lambda: f"Connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url} (attempt {attempt}/{max_attempts})"),
-            (['connection refused'], False,
+            (['connection refused'],
              lambda: f"Connection refused for URL: {url} (attempt {attempt}/{max_attempts})"),
-            (['connection reset'], False,
+            (['connection reset'],
              lambda: f"Connection reset for URL: {url} (attempt {attempt}/{max_attempts})"),
-            (['certificate verify failed'], False,
+            (['certificate verify failed'],
              lambda: f"SSL certificate verification failed for URL: {url}"),
-            
-            # Certificate errors (need cert info)
-            (['certificate has expired', 'cert_has_expired'], True,
+            # Certificate errors (lazy cert info lookup via get_cert_info())
+            (['certificate has expired', 'cert_has_expired'],
              lambda: f"SSL certificate expired on {get_cert_info().get('expiration', 'unknown date')} for URL: {url}"),
-            (['self signed certificate in certificate chain'], True,
+            (['self signed certificate in certificate chain'],
              lambda: f"SSL certificate chain contains self-signed certificate (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for URL: {url}"),
-            (['self signed certificate', 'self_signed_cert'], True,
+            (['self signed certificate', 'self_signed_cert'],
              lambda: f"SSL certificate is self-signed (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for URL: {url} - use a trusted CA like Let's Encrypt"),
-            (['unable to get local issuer'], True,
+            (['unable to get local issuer'],
              lambda: f"SSL certificate chain incomplete for URL: {url} - missing intermediate certificate for issuer: {get_cert_info().get('issuer_name', 'unknown')}"),
-            (['unknown ca', 'unable to get issuer'], True,
+            (['unknown ca', 'unable to get issuer'],
              lambda: f"SSL certificate from unknown CA \"{get_cert_info().get('issuer_name', 'unknown')}\" for URL: {url} - use a trusted CA like Let's Encrypt"),
-            (['handshake failure', 'handshake_failure'], True,
+            (['handshake failure', 'handshake_failure'],
              lambda: f"TLS handshake failed for URL: {url} - server offered {get_cert_info().get('tls_version', 'unknown version')}, minimum required is TLS 1.2"),
         ]
         
@@ -550,9 +713,9 @@ class ParallelAROIValidator:
             return f"SSL hostname mismatch: certificate valid for {cert_hosts_str} but URL hostname is {hostname}"
         
         # Match against pattern table
-        for patterns, _, template_func in error_patterns:
+        for patterns, message_func in error_patterns:
             if any(p in error_lower for p in patterns):
-                return template_func()
+                return message_func()
         
         # Generic fallback
         return f"SSL error for URL: {url}: {error_str[:150]}"
@@ -608,6 +771,9 @@ class ParallelAROIValidator:
         Returns:
             List of validation results
         """
+        # Clear domain cache at start of each validation run
+        self.clear_domain_cache()
+        
         # Fetch relays if not provided
         if relays is None:
             relays = self.fetch_relay_data(limit)
@@ -659,6 +825,23 @@ class ParallelAROIValidator:
                     if progress_callback:
                         progress_callback(completed, total_relays, error_result)
         
+        # Log summary of domain cache results (single pass)
+        with self._domain_cache_lock:
+            failed_count, success_count = 0, 0
+            failed_details = []
+            for domain, entry in self._domain_cache.items():
+                if entry['status'] == 'failed':
+                    failed_count += 1
+                    failed_details.append((domain, entry.get('data', '')))
+                elif entry['status'] == 'success':
+                    success_count += 1
+            if failed_count:
+                logger.info(f"Domain cache: {failed_count} domains unreachable (after max attempts)")
+                for domain, error in failed_details:
+                    logger.debug(f"  - {domain}: {error[:80] if error else 'unknown error'}")
+            if success_count:
+                logger.info(f"Domain cache: {success_count} domains reachable and cached")
+        
         return results
 
 
@@ -667,7 +850,7 @@ def run_validation(
     stop_check: Optional[Callable] = None,
     limit: Optional[int] = None,
     parallel: bool = True,
-    max_workers: int = 10,
+    max_workers: int = 20,
     verify_certificates: bool = DEFAULT_VERIFY_CERTIFICATES,
     allow_legacy_tls: bool = DEFAULT_ALLOW_LEGACY_TLS
 ) -> List[Dict[str, Any]]:
@@ -830,15 +1013,12 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
         filename = _sanitize_filename(filename)
     
     statistics = calculate_statistics(results)
-    timestamp = datetime.now().isoformat()
     
+    # Metadata is a subset of statistics plus timestamp (avoid duplication)
     output_data = {
         'metadata': {
-            'timestamp': timestamp,
-            'total_relays': statistics['total_relays'],
-            'valid_relays': statistics['valid_relays'],
-            'invalid_relays': statistics['invalid_relays'],
-            'success_rate': statistics['success_rate']
+            'timestamp': datetime.now().isoformat(),
+            **{k: statistics[k] for k in ('total_relays', 'valid_relays', 'invalid_relays', 'success_rate')}
         },
         'statistics': statistics,
         'results': results
