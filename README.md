@@ -175,7 +175,7 @@ The validator produces standardized error messages categorized by proof type. Ea
 
 | Error Message |
 |---------------|
-| `URI-RSA: Fingerprint not listed at <domain>` |
+| `URI-RSA: Fingerprint not found at <domain>` |
 
 ### URI-RSA: HTTP Errors
 

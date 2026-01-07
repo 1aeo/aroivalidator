@@ -463,7 +463,7 @@ class ParallelAROIValidator:
                 })
                 return result
             else:
-                result['error'] = f"URI-RSA: Fingerprint not listed at {domain}"
+                result['error'] = f"URI-RSA: Fingerprint not found at {domain}"
                 return result
         
         # status == 'should_test': We should test this domain
@@ -488,7 +488,7 @@ class ParallelAROIValidator:
                 })
                 return result
             else:
-                result['error'] = f"URI-RSA: Fingerprint not listed at {domain}"
+                result['error'] = f"URI-RSA: Fingerprint not found at {domain}"
                 return result
         
         all_errors = [error]
@@ -517,7 +517,7 @@ class ParallelAROIValidator:
                     })
                     return result
                 else:
-                    result['error'] = f"URI-RSA: Fingerprint not listed at {domain}"
+                    result['error'] = f"URI-RSA: Fingerprint not found at {domain}"
                     return result
             else:
                 all_errors.append(error)
