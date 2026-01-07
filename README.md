@@ -137,3 +137,97 @@ Security-relevant events are logged:
 2. Monitor logs for security warnings
 3. Consider enabling certificate verification if your target relays support it
 4. Use appropriate network firewall rules to limit outbound connections
+
+## Error Messages Reference
+
+The validator produces standardized error messages categorized by proof type. Each error in the JSON output is paired with the relay's fingerprint.
+
+### Missing Fields
+
+| Error Message |
+|---------------|
+| `No contact information` |
+| `Missing AROI fields: ciissversion, proof` |
+| `Missing AROI fields: proof` |
+| `Missing AROI fields: ciissversion` |
+| `Missing AROI field: url, required for URI-RSA proof` |
+| `Missing AROI field: url, required for DNS-RSA proof` |
+
+### Unsupported/Invalid
+
+| Error Message |
+|---------------|
+| `Unsupported ciissversion: <version>` |
+| `Unsupported proof type: <type>` |
+| `DNS-RSA: Invalid domain in url field: <url>` |
+| `URI-RSA: Invalid domain in url field: <url>` |
+
+### DNS-RSA Errors
+
+| Error Message |
+|---------------|
+| `DNS-RSA: TXT record not found at <domain>` |
+| `DNS-RSA: Lookup failed, no TXT record answer for <domain>` |
+| `DNS-RSA: Lookup failed: <error>` |
+| `DNS-RSA: TXT record has invalid proof content. Expected 'we-run-this-tor-relay', found: <content>` |
+
+### URI-RSA: Fingerprint Not Found
+
+| Error Message |
+|---------------|
+| `URI-RSA: Fingerprint not listed at <domain>` |
+
+### URI-RSA: HTTP Errors
+
+| Error Message |
+|---------------|
+| `URI-RSA: HTTP error <code> for <domain> at URL: <URL>` |
+
+### URI-RSA: HTTP SSL/TLS Errors
+
+| Error Message |
+|---------------|
+| `URI-RSA: HTTP SSL handshake failure due to older version <version> for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL handshake failure due to SSLv3 handshake for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL error unexpected EOF for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate verification failed for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate expired on <date> for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate is self-signed (issuer: <issuer>) for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate chain contains self-signed cert (issuer: <issuer>) for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate chain incomplete for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL unknown CA "<issuer>" for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL hostname mismatch for remote <hosts> but expected <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL error <error> for <domain> at URL: <URL>` |
+
+### URI-RSA: HTTP Name Resolution Errors
+
+| Error Message |
+|---------------|
+| `URI-RSA: HTTP error name resolution failed for <domain> at URL: <URL>` |
+
+### URI-RSA: HTTP Connection Errors
+
+| Error Message |
+|---------------|
+| `URI-RSA: HTTP error connection timed out after 5s for URL: <URL>` |
+| `URI-RSA: HTTP error connection refused for URL: <URL>` |
+| `URI-RSA: HTTP error connection reset for URL: <URL>` |
+| `URI-RSA: HTTP error connection max retries exceeded for URL: <URL>` |
+| `URI-RSA: HTTP error connection remote end closed connection for URL: <URL>` |
+| `URI-RSA: HTTP error <error> for URL: <URL>` |
+
+### URI-RSA: Cached Domain Errors
+
+When a domain has been tested multiple times and failed, subsequent requests use the cached result:
+
+| Error Message |
+|---------------|
+| `URI-RSA: HTTP error connection timed out after 5s for URL: <URL>. Used domain cache after N attempts.` |
+| `URI-RSA: HTTP error connection max retries exceeded for URL: <URL>. Used domain cache after N attempts.` |
+| `URI-RSA: HTTP error <code> for <domain> at URL: <URL>. Used domain cache after N attempts.` |
+
+### Other
+
+| Error Message |
+|---------------|
+| `Validation exception: <error>` |

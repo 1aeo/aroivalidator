@@ -224,9 +224,9 @@ class ParallelAROIValidator:
                 cache_entry['fingerprints'] = self._parse_fingerprint_list(data) if data else set()
                 logger.info(f"Domain cached as reachable: {domain}")
             elif cache_entry['attempts'] >= self._domain_max_attempts:
-                # Exhausted all attempts
+                # Exhausted all attempts - append cache suffix to error message
                 cache_entry['status'] = 'failed'
-                cache_entry['data'] = f"{data} (after {cache_entry['attempts']} attempts)"
+                cache_entry['data'] = f"{data}. Used domain cache after {cache_entry['attempts']} attempts."
                 logger.info(f"Domain cached as unreachable after {cache_entry['attempts']} attempts: {domain}")
             else:
                 # Still have attempts left - mark as retry so next thread tries
@@ -360,13 +360,13 @@ class ParallelAROIValidator:
         """Validate DNS-RSA proof"""
         url = aroi_fields.get('url')
         if not url:
-            result['error'] = "Missing URL for DNS-RSA proof"
+            result['error'] = "Missing AROI field: url, required for DNS-RSA proof"
             return result
         
         # Extract domain
         domain = self._extract_domain(url)
         if not domain:
-            result['error'] = f"Invalid URL for DNS-RSA proof: {url}"
+            result['error'] = f"DNS-RSA: Invalid domain in url field: {url}"
             return result
         
         result['proof_type'] = PROOF_TYPE_DNS_RSA
@@ -376,7 +376,7 @@ class ParallelAROIValidator:
         status, data = self._get_domain_status(domain)
         
         if status == 'failed':
-            result['error'] = f"Domain unreachable (cached): {data}"
+            result['error'] = data  # Error already has cache suffix from _set_domain_result
             return result
         # Note: DNS-RSA doesn't benefit from 'success' caching since each relay
         # has a unique subdomain query. We still check for 'failed' to skip dead domains.
@@ -404,17 +404,17 @@ class ParallelAROIValidator:
             else:
                 # Show actual content found
                 found_content = '; '.join(txt_records)[:100] if txt_records else 'empty'
-                result['error'] = f"Invalid proof content in DNS TXT record: expected 'we-run-this-tor-relay', found: {found_content}"
+                result['error'] = f"DNS-RSA: TXT record has invalid proof content. Expected 'we-run-this-tor-relay', found: {found_content}"
         except (dns.resolver.Timeout, dns.resolver.NoNameservers) as e:
             # Record DNS timeout/unreachable (counts toward domain's attempt limit)
-            error_msg = f"DNS lookup failed: {str(e)}"
+            error_msg = f"DNS-RSA: Lookup failed: {str(e)}"
             self._set_domain_result(domain, success=False, data=error_msg)
             result['error'] = error_msg
         except dns.resolver.NXDOMAIN:
             # NXDOMAIN is expected for relays not in the list - don't count against domain
-            result['error'] = f"DNS record not found: {query_domain}"
+            result['error'] = f"DNS-RSA: TXT record not found at {domain}"
         except Exception as e:
-            result['error'] = f"DNS lookup failed: {str(e)}"
+            result['error'] = f"DNS-RSA: Lookup failed: {str(e)}"
         
         return result
     
@@ -422,7 +422,7 @@ class ParallelAROIValidator:
         """Validate URI-RSA proof according to ContactInfo spec"""
         url = aroi_fields.get('url')
         if not url:
-            result['error'] = "Missing URL for uri-rsa proof"
+            result['error'] = "Missing AROI field: url, required for URI-RSA proof"
             return result
         
         # Normalize URL (ensure it has a scheme)
@@ -433,6 +433,11 @@ class ParallelAROIValidator:
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         domain = parsed.netloc
         
+        # Validate domain before proceeding
+        if not domain or '.' not in domain:
+            result['error'] = f"URI-RSA: Invalid domain in url field: {aroi_fields.get('url')}"
+            return result
+        
         result['proof_type'] = PROOF_TYPE_URI_RSA
         result['domain'] = domain
         
@@ -442,7 +447,7 @@ class ParallelAROIValidator:
         status, data = self._get_domain_status(domain)
         
         if status == 'failed':
-            result['error'] = f"Domain unreachable (cached): {data}"
+            result['error'] = data  # Error already has cache suffix from _set_domain_result
             return result
         elif status == 'success':
             # Domain succeeded before - use cached fingerprint set for O(1) lookup
@@ -458,7 +463,7 @@ class ParallelAROIValidator:
                 })
                 return result
             else:
-                result['error'] = f"Fingerprint not found: fingerprint {fingerprint} not listed at {domain}"
+                result['error'] = f"URI-RSA: Fingerprint not listed at {domain}"
                 return result
         
         # status == 'should_test': We should test this domain
@@ -483,7 +488,7 @@ class ParallelAROIValidator:
                 })
                 return result
             else:
-                result['error'] = f"Fingerprint not found in URL: fingerprint {fingerprint} not listed at {primary_url}"
+                result['error'] = f"URI-RSA: Fingerprint not listed at {domain}"
                 return result
         
         all_errors = [error]
@@ -512,7 +517,7 @@ class ParallelAROIValidator:
                     })
                     return result
                 else:
-                    result['error'] = f"Fingerprint not found in URL: fingerprint {fingerprint} not listed at {www_url}"
+                    result['error'] = f"URI-RSA: Fingerprint not listed at {domain}"
                     return result
             else:
                 all_errors.append(error)
@@ -631,22 +636,32 @@ class ParallelAROIValidator:
                 return response, "", attempt
                 
             except requests.exceptions.Timeout as e:
-                last_error = f"Connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url} (attempt {attempt}/{max_attempts})"
+                last_error = f"URI-RSA: HTTP error connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url}"
                 if attempt < max_attempts:
                     continue  # Retry
                     
             except requests.exceptions.ConnectionError as e:
                 error_str = str(e).lower()
                 if 'refused' in error_str:
-                    last_error = f"Connection refused for URL: {url} (attempt {attempt}/{max_attempts})"
+                    last_error = f"URI-RSA: HTTP error connection refused for URL: {url}"
                     if attempt < max_attempts:
                         continue  # Retry
                 elif 'reset' in error_str:
-                    last_error = f"Connection reset for URL: {url} (attempt {attempt}/{max_attempts})"
+                    last_error = f"URI-RSA: HTTP error connection reset for URL: {url}"
                     if attempt < max_attempts:
                         continue  # Retry
+                elif 'remotedisconnected' in error_str or 'remote end closed' in error_str:
+                    last_error = f"URI-RSA: HTTP error connection remote end closed connection for URL: {url}"
+                    break  # Don't retry
+                elif 'max retries' in error_str or 'nameresolution' in error_str:
+                    domain = urlparse(url).netloc
+                    if 'nameresolution' in error_str:
+                        last_error = f"URI-RSA: HTTP error name resolution failed for {domain} at URL: {url}"
+                    else:
+                        last_error = f"URI-RSA: HTTP error connection max retries exceeded for URL: {url}"
+                    break  # Don't retry
                 else:
-                    last_error = f"Connection error for URL: {url}: {str(e)[:100]}"
+                    last_error = f"URI-RSA: HTTP error connection max retries exceeded for URL: {url}"
                     break  # Don't retry other connection errors
                     
             except requests.exceptions.SSLError as e:
@@ -654,11 +669,12 @@ class ParallelAROIValidator:
                 break  # Don't retry SSL errors
                 
             except requests.exceptions.HTTPError as e:
-                last_error = f"HTTP error {e.response.status_code} {e.response.reason} for URL: {url}"
+                domain = urlparse(url).netloc
+                last_error = f"URI-RSA: HTTP error {e.response.status_code} for {domain} at URL: {url}"
                 break  # Don't retry HTTP errors
                 
             except Exception as e:
-                last_error = f"Failed to fetch URL: {url}: {str(e)[:100]}"
+                last_error = f"URI-RSA: HTTP error {str(e)[:100]} for URL: {url}"
                 break
         
         return None, last_error, attempt
@@ -682,35 +698,42 @@ class ParallelAROIValidator:
         
         # Table-driven error pattern matching: (patterns, message_func)
         error_patterns = [
-            # Connection errors
+            # Connection errors (these still use old format as they're handled in _fetch_with_retry)
             (['timed out', 'timeout'],
-             lambda: f"Connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url} (attempt {attempt}/{max_attempts})"),
+             lambda: f"URI-RSA: HTTP error connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url}"),
             (['connection refused'],
-             lambda: f"Connection refused for URL: {url} (attempt {attempt}/{max_attempts})"),
+             lambda: f"URI-RSA: HTTP error connection refused for URL: {url}"),
             (['connection reset'],
-             lambda: f"Connection reset for URL: {url} (attempt {attempt}/{max_attempts})"),
+             lambda: f"URI-RSA: HTTP error connection reset for URL: {url}"),
+            # SSL Certificate errors
             (['certificate verify failed'],
-             lambda: f"SSL certificate verification failed for URL: {url}"),
-            # Certificate errors (lazy cert info lookup via get_cert_info())
+             lambda: f"URI-RSA: HTTP SSL certificate verification failed for {hostname} at URL: {url}"),
             (['certificate has expired', 'cert_has_expired'],
-             lambda: f"SSL certificate expired on {get_cert_info().get('expiration', 'unknown date')} for URL: {url}"),
+             lambda: f"URI-RSA: HTTP SSL certificate expired on {get_cert_info().get('expiration', 'unknown date')} for {hostname} at URL: {url}"),
             (['self signed certificate in certificate chain'],
-             lambda: f"SSL certificate chain contains self-signed certificate (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for URL: {url}"),
+             lambda: f"URI-RSA: HTTP SSL certificate chain contains self-signed cert (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
             (['self signed certificate', 'self_signed_cert'],
-             lambda: f"SSL certificate is self-signed (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for URL: {url} - use a trusted CA like Let's Encrypt"),
+             lambda: f"URI-RSA: HTTP SSL certificate is self-signed (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
             (['unable to get local issuer'],
-             lambda: f"SSL certificate chain incomplete for URL: {url} - missing intermediate certificate for issuer: {get_cert_info().get('issuer_name', 'unknown')}"),
+             lambda: f"URI-RSA: HTTP SSL certificate chain incomplete for {hostname} at URL: {url}"),
             (['unknown ca', 'unable to get issuer'],
-             lambda: f"SSL certificate from unknown CA \"{get_cert_info().get('issuer_name', 'unknown')}\" for URL: {url} - use a trusted CA like Let's Encrypt"),
+             lambda: f"URI-RSA: HTTP SSL unknown CA \"{get_cert_info().get('issuer_name', 'unknown')}\" for {hostname} at URL: {url}"),
+            # SSLv3 handshake failure (specific pattern)
+            (['sslv3_alert_handshake_failure', 'sslv3 alert handshake'],
+             lambda: f"URI-RSA: HTTP SSL handshake failure due to SSLv3 handshake for {hostname} at URL: {url}"),
+            # General TLS handshake failure
             (['handshake failure', 'handshake_failure'],
-             lambda: f"TLS handshake failed for URL: {url} - server offered {get_cert_info().get('tls_version', 'unknown version')}, minimum required is TLS 1.2"),
+             lambda: f"URI-RSA: HTTP SSL handshake failure due to older version {get_cert_info().get('tls_version', 'unknown')} for {hostname} at URL: {url}"),
+            # Unexpected EOF
+            (['unexpected_eof', 'unexpected eof'],
+             lambda: f"URI-RSA: HTTP SSL error unexpected EOF for {hostname} at URL: {url}"),
         ]
         
         # Special case: hostname mismatch (requires compound check)
         if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
             cert_hosts = get_cert_info().get('hostnames', ['unknown'])
             cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
-            return f"SSL hostname mismatch: certificate valid for {cert_hosts_str} but URL hostname is {hostname}"
+            return f"URI-RSA: HTTP SSL hostname mismatch for remote {cert_hosts_str} but expected {hostname} at URL: {url}"
         
         # Match against pattern table
         for patterns, message_func in error_patterns:
@@ -718,7 +741,7 @@ class ParallelAROIValidator:
                 return message_func()
         
         # Generic fallback
-        return f"SSL error for URL: {url}: {error_str[:150]}"
+        return f"URI-RSA: HTTP SSL error {error_str[:100]} for {hostname} at URL: {url}"
     
     def _extract_domain(self, url: str) -> Optional[str]:
         """
