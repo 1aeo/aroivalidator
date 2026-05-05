@@ -122,21 +122,27 @@ _HOST_SAFETY_LOCK = threading.Lock()
 
 
 def _ip_is_safe(ip: str) -> bool:
-    """Return True if the IP literal is a routable public address."""
+    """Return True if the IP is a globally-routable unicast address.
+
+    Deny-by-default predicate built on `is_global`: only addresses Python
+    classifies as globally routable AND not multicast pass. This catches:
+      - all of is_loopback / is_private / is_link_local / is_reserved /
+        is_unspecified (none of these are is_global)
+      - CGN / shared address space (100.64.0.0/10, RFC6598) — Python
+        considers this not-global despite is_private being False
+      - benchmarking (198.18.0.0/15)
+      - TEST-NET-* documentation prefixes (192.0.2.0/24, 198.51.100.0/24,
+        203.0.113.0/24)
+      - IETF protocol assignments (192.0.0.0/24)
+    AND additionally rejects multicast, which Python's is_global flag
+    surprisingly returns True for despite being unsuitable as a unicast
+    HTTPS target.
+    """
     try:
         ip_obj = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    # Reject every non-public class explicitly so future address types
-    # default-deny rather than default-allow.
-    return not (
-        ip_obj.is_loopback
-        or ip_obj.is_private
-        or ip_obj.is_link_local
-        or ip_obj.is_multicast
-        or ip_obj.is_reserved
-        or ip_obj.is_unspecified
-    )
+    return bool(ip_obj.is_global) and not ip_obj.is_multicast
 
 
 def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
@@ -944,16 +950,27 @@ class ParallelAROIValidator:
 
         # All variants failed. Pick the most-actionable category across all
         # attempts (e.g. uri_file_missing on either primary or www trumps a
-        # generic transport_error from the other).
-        chosen_category = next(
-            (c for c in all_categories if c in self._URI_PREFERRED_CATEGORIES),
-            all_categories[0] if all_categories else None,
+        # generic transport_error from the other). Pin both the chosen
+        # category AND the message that produced it together, so the
+        # cache entry surfaces a coherent (message, category) pair to
+        # subsequent relays — not the first attempt's message paired with
+        # a later attempt's category.
+        chosen_idx = next(
+            (i for i, c in enumerate(all_categories)
+             if c in self._URI_PREFERRED_CATEGORIES),
+            0 if all_categories else -1,
+        )
+        chosen_category = (
+            all_categories[chosen_idx] if chosen_idx >= 0 else None
         ) or 'transport_error'
+        chosen_msg = (
+            all_errors[chosen_idx] if chosen_idx >= 0 else None
+        ) or "Failed to fetch URI proof"
 
-        combined_msg = "; ".join(e for e in all_errors if e) or "Failed to fetch URI proof"
+        combined_msg = "; ".join(e for e in all_errors if e) or chosen_msg
         self._set_domain_result(
             cache_key, success=False,
-            error_msg=all_errors[0],
+            error_msg=chosen_msg,           # aligned with chosen_category
             error_category=chosen_category,
         )
         result['error'] = combined_msg

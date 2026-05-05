@@ -179,17 +179,26 @@ threat surface — a relay operator publishing a private/loopback URL).
 The validator uses configurable TLS settings to balance security with compatibility:
 
 - **Minimum TLS Version**: TLS 1.2 (TLS 1.0/1.1 are deprecated and no longer supported)
-- **Legacy Mode**: Relaxed cipher settings (SECLEVEL=1) available for older servers
-- **Certificate Verification**: Disabled by default for relay operator domains (see below)
+- **Legacy Mode**: Relaxed cipher settings (SECLEVEL=1) available for older servers (`DEFAULT_ALLOW_LEGACY_TLS = True`)
+- **Certificate Verification**: **Enabled by default** (`DEFAULT_VERIFY_CERTIFICATES = True`)
 
 ### Certificate Verification
 
-Certificate verification is disabled by default when connecting to relay operator domains because:
-1. Many Tor relay operators use self-signed certificates
-2. Some have misconfigured TLS (expired certs, wrong hostnames)
-3. The validator only fetches public proof files, not sensitive data
+Certificate verification is **enabled by default** when connecting to
+relay operator domains. CIISS v3 spec mandates HTTPS endpoints for proof
+URIs MUST use certificates from a well-known trusted certificate authority
+(e.g. Let's Encrypt). We enforce that.
 
-This is a deliberate security trade-off for this specific use case. The Onionoo API (torproject.org) connections always use proper TLS verification.
+Operators with self-signed or otherwise non-trusted certificates will see
+their relay validation fail with `URI-RSA: HTTP SSL certificate
+verification failed` (or the URI-FamilyID equivalent for v3) and a
+specific category-tagged error pointing them at the fix.
+
+Verification can be disabled programmatically (e.g. for testing or
+specialised deployments) by passing `verify_certificates=False` to
+`ParallelAROIValidator(...)` or `run_validation(...)`. The Onionoo API
+(torproject.org) connections always use proper TLS verification regardless
+of this setting.
 
 ### Input Validation
 
@@ -200,16 +209,17 @@ This is a deliberate security trade-off for this specific use case. The Onionoo 
 ### Logging
 
 Security-relevant events are logged:
-- Disabled certificate verification warnings
+- Disabled certificate verification warnings (only fires if explicitly opted out)
 - Legacy TLS mode activation
 - Invalid filename attempts (potential path traversal)
 - JSON parsing errors
+- SSRF gate rejections (IP literals, private/loopback resolutions)
 
 ### Recommendations for Production Use
 
 1. Run in a sandboxed environment if processing untrusted relay data
-2. Monitor logs for security warnings
-3. Consider enabling certificate verification if your target relays support it
+2. Monitor logs for security warnings (especially SSRF gate rejections)
+3. Keep certificate verification enabled (the default) to enforce CIISS v3's trusted-CA requirement
 4. Use appropriate network firewall rules to limit outbound connections
 
 ## Error Messages Reference

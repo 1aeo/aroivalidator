@@ -145,32 +145,49 @@ def test_case_mismatch_diagnostic():
 
 
 def test_ip_safety_classification():
-    """_ip_is_safe must reject every non-public class outright."""
+    """_ip_is_safe must reject every non-globally-routable address.
+
+    Uses ip.is_global semantics (deny-by-default), so it covers gaps that
+    enumerated is_private/is_reserved would miss — notably CGN/shared
+    address space (100.64.0.0/10) and benchmarking ranges.
+    """
     UNSAFE = [
-        '127.0.0.1',         # loopback
-        '127.255.255.254',
-        '10.0.0.1',          # RFC1918
-        '10.255.255.255',
-        '172.16.0.1',        # RFC1918
-        '172.31.255.254',
-        '192.168.1.1',       # RFC1918
-        '169.254.169.254',   # link-local / cloud metadata (AWS/GCP/Azure)
-        '0.0.0.0',           # unspecified
-        '224.0.0.1',         # multicast
-        '255.255.255.255',   # reserved/broadcast
-        '::1',               # IPv6 loopback
-        'fe80::1',           # IPv6 link-local
-        'fc00::1',           # IPv6 unique local (private)
-        'fd00::1',           # IPv6 unique local (private)
-        'ff02::1',           # IPv6 multicast
-        '::',                # IPv6 unspecified
+        # Loopback
+        '127.0.0.1', '127.255.255.254', '::1',
+        # Unspecified
+        '0.0.0.0', '::',
+        # Link-local
+        '169.254.169.254',  # cloud metadata (AWS/GCP/Azure)
+        'fe80::1',
+        # RFC1918 / RFC4193
+        '10.0.0.1', '10.255.255.255',
+        '172.16.0.1', '172.31.255.254',
+        '192.168.1.1',
+        'fc00::1', 'fd00::1',
+        # Multicast / reserved
+        '224.0.0.1',
+        '255.255.255.255',
+        'ff02::1',
+        # Carrier-Grade NAT / shared address space (RFC6598)
+        # — NOT covered by is_private; only is_global catches this.
+        '100.64.0.1', '100.127.255.254',
+        # IETF protocol assignments / TEST-NET / benchmarking
+        '192.0.0.1',     # IETF Protocol Assignments
+        '192.0.2.1',     # TEST-NET-1 (RFC5737)
+        '198.51.100.1',  # TEST-NET-2
+        '203.0.113.1',   # TEST-NET-3
+        '198.18.0.1',    # benchmarking (RFC2544)
+        '198.19.255.254',
     ]
     for ip in UNSAFE:
-        assert not _ip_is_safe(ip), f"{ip!r} should be classified unsafe"
-    SAFE = ['8.8.8.8', '1.1.1.1', '93.184.216.34', '2606:2800:220:1::6']
+        assert not _ip_is_safe(ip), f"{ip!r} should be classified unsafe (non-global)"
+    SAFE = [
+        '8.8.8.8', '1.1.1.1', '93.184.216.34',
+        '2606:2800:220:1::6',  # example.com IPv6
+    ]
     for ip in SAFE:
-        assert _ip_is_safe(ip), f"{ip!r} should be classified safe"
-    print("  ✓ _ip_is_safe correctly classifies private/loopback/link-local/multicast/reserved")
+        assert _ip_is_safe(ip), f"{ip!r} should be classified safe (globally routable)"
+    print("  ✓ _ip_is_safe rejects all non-global ranges incl. CGN, TEST-NET, benchmarking")
 
 
 def test_is_safe_public_host_rejects_ip_literals():
