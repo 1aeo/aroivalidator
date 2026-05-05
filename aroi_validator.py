@@ -1211,7 +1211,13 @@ def calculate_statistics(results: List[Dict]) -> Dict:
                 counter[1] += 1
         else:
             no_proof_total += 1
-            if r.get('ciissversion') == '3':
+            # ciissversion3_no_url only counts SPEC-COMPLIANT v3 relays that
+            # declared ciissversion:3 with informational fields and no url.
+            # Such relays have ciissversion='3', proof_type=None, error=None.
+            # Filtered-out / unsupported relays have error set (and category
+            # 'ciissversion_unsupported'), so they go in no_aroi here too.
+            if (r.get('ciissversion') == '3'
+                    and r.get('error') is None):
                 ciissv3_no_url += 1
             else:
                 no_aroi += 1
