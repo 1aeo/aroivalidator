@@ -332,6 +332,18 @@ ed25519 family ID, not an RSA fingerprint, is being verified).
 | `URI-FamilyID: family_id not found at <domain>` (`+ " (case mismatch detected — spec requires case-sensitive match)"` when applicable) | `uri_content_mismatch` |
 | (HTTP/SSL transport errors — same templates as URI-RSA, with `URI-FamilyID:` prefix) | `transport_error` |
 
+#### SSRF / Redirect Errors (URI proofs, both v2 and v3)
+
+These prevent the validator from following untrusted redirects or
+connecting to private/loopback addresses. Same templates apply to v2
+(`URI-RSA:` prefix) and v3 (`URI-FamilyID:` prefix).
+
+| Error Message | error_category |
+|---|---|
+| `<URI-RSA \| URI-FamilyID>: url is an IP literal, not a domain (SSRF-blocked: <ip>)` | `unsafe_target` |
+| `<URI-RSA \| URI-FamilyID>: resolves to non-public address(es): <ip,...> (SSRF-blocked: <hostname>)` | `unsafe_target` |
+| `<URI-RSA \| URI-FamilyID>: HTTP redirect (<3xx>) to <Location> for <domain> at URL: <url> — CIISS spec disallows redirects on proof URI` | `redirect_disallowed` |
+
 #### Security
 
 | Error Message | error_category |
@@ -514,6 +526,8 @@ RSA fingerprints.
 | `URI-FamilyID: family_id not found at <domain>` | `uri_content_mismatch` | File exists but doesn't contain this relay's family_id. Check `.public_family_id` contents (case matters). |
 | `Missing AROI field: proof, required when url is set` (v3) | `missing_proof_field` | With `ciissversion:3`, `proof` is mandatory whenever `url` is set. Add a v3 proof type or remove `url:`. |
 | `SECURITY: ... published content appears to contain .secret_family_key. Rotate immediately.` | `secret_key_leaked` | **SECURITY INCIDENT.** Rotate the family key NOW with `tor --keygen-family <new-file>`, replace the published value with the new `.public_family_id`, update every relay's Tor config. |
+| `... url is an IP literal, not a domain (SSRF-blocked: <ip>)` or `... resolves to non-public address(es): ...` | `unsafe_target` | The `url:` field must point at a publicly-routable domain (your operator website). IP literals and hostnames resolving to loopback / private (RFC1918, RFC4193) / link-local addresses are rejected as SSRF-unsafe. |
+| `... HTTP redirect (<3xx>) to <location> ... CIISS spec disallows redirects on proof URI` | `redirect_disallowed` | The `.well-known` proof file must be served directly with no 3xx redirects. Remove redirects from the `/.well-known/tor-relay/` path on your webserver. |
 
 To see all failures grouped by category for any saved batch run:
 

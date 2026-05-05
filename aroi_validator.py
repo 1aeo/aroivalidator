@@ -896,14 +896,23 @@ class ParallelAROIValidator:
             all_categories.append(error_category)
 
             # After the primary, decide whether to try www-fallback.
+            #
+            # Skip the fallback when:
+            #  - primary failed with a connectivity error (the host is
+            #    unreachable; www variant won't help if the parent is down)
+            #  - primary returned an HTTP redirect (CIISS-spec rejection
+            #    that applies equally to www; trying www just produces a
+            #    duplicate error message)
+            #  - the SSRF gate rejects the www host (different A records
+            #    pointing into private space).
             if not _is_www and len(attempts) == 1:
                 is_connectivity = any(
                     p in error_msg.lower() for p in _CONNECTIVITY_ERROR_PATTERNS
                 )
-                if not is_connectivity and not domain.startswith('www.'):
+                if (not is_connectivity
+                        and error_category != 'redirect_disallowed'
+                        and not domain.startswith('www.')):
                     www_host = f"www.{domain}"
-                    # SSRF gate the www variant too — operators can have
-                    # divergent A records for naked vs www.
                     safe_www, _reason = is_safe_public_host(www_host)
                     if safe_www:
                         attempts.append((f"https://{www_host}{path}", www_host, True))
@@ -1084,11 +1093,16 @@ class ParallelAROIValidator:
                     allow_redirects=False,
                 )
                 if 300 <= response.status_code < 400:
+                    # CIISS spec: proof URI MUST NOT redirect to another
+                    # domain. Disabling redirects also acts as SSRF defense
+                    # (a 3xx to a private/loopback IP would otherwise be
+                    # silently followed by `requests`).
                     domain = urlparse(url).hostname or ''
+                    location = response.headers.get('Location', '<no Location header>')
                     last_error = (
                         f"{error_label}: HTTP redirect ({response.status_code}) "
-                        f"for {domain} at URL: {url} — CIISS spec disallows "
-                        f"redirects on proof URI"
+                        f"to {location} for {domain} at URL: {url} — CIISS spec "
+                        f"disallows redirects on proof URI"
                     )
                     last_category = 'redirect_disallowed'
                     break

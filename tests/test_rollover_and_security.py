@@ -235,8 +235,9 @@ def test_uri_validation_blocked_for_private_resolution():
 
 
 def test_redirect_disallowed():
-    """An HTTP redirect on the proof URI must NOT be followed (CIISS spec) and
-    must produce a redirect_disallowed error."""
+    """An HTTP redirect on the proof URI must NOT be followed (CIISS spec)
+    and must produce a single redirect_disallowed error containing the
+    Location header for diagnostic value."""
     _clear_host_safety_cache()
     v = ParallelAROIValidator(max_workers=1)
     relay = {
@@ -245,26 +246,37 @@ def test_redirect_disallowed():
         'family_ids': ['fid'],
         'contact': 'url:public.invalid proof:uri-familyid-ed25519 ciissversion:3',
     }
-    # Mock session.get to return a 301
     fake_response = MagicMock()
     fake_response.status_code = 301
-    fake_response.headers = {'Location': 'https://attacker.invalid/'}
+    fake_response.headers = {'Location': 'https://attacker.invalid/somewhere'}
 
-    # Patch the session at module level: a 301 response shouldn't be followed
     with patch.object(v.session, 'get', return_value=fake_response) as mock_get:
         out = v.validate_relay(relay)
 
-    # session.get must have been called; allow_redirects must be False.
+    # session.get called with allow_redirects=False (SSRF defense).
     assert mock_get.call_count >= 1
     for call in mock_get.call_args_list:
-        kwargs = call.kwargs
-        assert kwargs.get('allow_redirects') is False, (
-            f"allow_redirects must be False for SSRF defense; got {kwargs}"
+        assert call.kwargs.get('allow_redirects') is False, (
+            f"allow_redirects must be False for SSRF defense; got {call.kwargs}"
         )
+
+    # Skipping www-fallback for redirects: primary 301 should NOT trigger
+    # a second fetch (operator's redirect policy applies equally to www).
+    assert mock_get.call_count == 1, (
+        f"www-fallback should be skipped for redirects; "
+        f"session.get was called {mock_get.call_count} times"
+    )
+
     assert out['valid'] is False
     assert out['error_category'] == 'redirect_disallowed', out
-    assert '301' in out['error'] or 'redirect' in out['error'].lower(), out
-    print("  ✓ redirect on proof URI: not followed, error_category=redirect_disallowed")
+    # Error must include status code AND the Location header for diagnostics
+    assert '301' in out['error'], out
+    assert 'https://attacker.invalid/somewhere' in out['error'], out
+    # And must NOT be the duplicated-via-www message
+    assert out['error'].count('HTTP redirect') == 1, (
+        f"redirect error should appear once, not duplicated via www: {out['error']!r}"
+    )
+    print("  ✓ redirect on proof URI: single error, Location captured, www-fallback skipped")
 
 
 def main():
