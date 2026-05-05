@@ -18,6 +18,88 @@ from aroi_validator import (
 )
 
 
+# Pretty labels for proof_types stats keys. Anything not in this dict falls
+# back to the raw key.
+_PROOF_TYPE_LABELS = {
+    'dns_rsa': 'DNS-RSA (ciissversion:2)',
+    'uri_rsa': 'URI-RSA (ciissversion:2)',
+    'dns_familyid_ed25519': 'DNS-FamilyID (ciissversion:3)',
+    'uri_familyid_ed25519': 'URI-FamilyID (ciissversion:3)',
+}
+
+
+def _render_proof_types_panel(st, stats):
+    """Render proof_types breakdown surfacing every populated proof type
+    (v2 + v3). Skips zero-count entries to keep the panel tight."""
+    st.subheader("🔍 Proof Type Analysis")
+    proof_types = stats.get('proof_types', {}) or {}
+
+    # Stable ordering: v2 first (dns_rsa, uri_rsa), then v3, then no_proof
+    order = ('dns_rsa', 'uri_rsa', 'dns_familyid_ed25519', 'uri_familyid_ed25519')
+    rendered = 0
+    for key in order:
+        info = proof_types.get(key)
+        if not info or info.get('total', 0) == 0:
+            continue
+        label = _PROOF_TYPE_LABELS.get(key, key)
+        st.write(
+            f"**{label}**: {info['valid']}/{info['total']} "
+            f"({info.get('success_rate', 0):.1f}%)"
+        )
+        rendered += 1
+
+    no_proof = proof_types.get('no_proof', {}) or {}
+    if no_proof.get('total', 0) > 0:
+        # Sub-breakdown when both v2-no-AROI and v3-informational-only are
+        # present; otherwise just show the total.
+        total = no_proof['total']
+        no_aroi = no_proof.get('no_aroi', total)
+        v3_no_url = no_proof.get('ciissversion3_no_url', 0)
+        if v3_no_url:
+            st.write(
+                f"**No Proof**: {total} "
+                f"(no AROI: {no_aroi}, ciissversion:3 informational-only: {v3_no_url})"
+            )
+        else:
+            st.write(f"**No Proof**: {total}")
+        rendered += 1
+
+    if rendered == 0:
+        st.info("No proof type data in this result set.")
+
+
+def _render_ciissversion_panel(st, stats):
+    """Render ciissversion adoption + v3 failure category breakdown.
+
+    Only renders when ciissversion data is present (older JSON without
+    ciissversion_declared just gets skipped — defensive for back-compat
+    with pre-schema-v2 saved results)."""
+    declared = stats.get('ciissversion_declared')
+    if not declared:
+        return
+
+    st.subheader("📐 ciissversion Adoption")
+    cols = st.columns(3)
+    cols[0].metric("ciissversion:2", declared.get('2', 0))
+    cols[1].metric("ciissversion:3", declared.get('3', 0))
+    cols[2].metric("none", declared.get('none', 0))
+
+    # v3 failure categories — only render the section if any non-zero counts
+    cats = stats.get('v3_failure_categories') or {}
+    nonzero = [(k, v) for k, v in cats.items() if v > 0]
+    if not nonzero:
+        return
+
+    nonzero.sort(key=lambda kv: -kv[1])
+    with st.expander(
+        f"🚧 ciissversion:3 migration health ({sum(v for _, v in nonzero)} relays with issues)"
+    ):
+        for cat, count in nonzero:
+            # Pretty-format the category name; show count with action hint
+            title = cat.replace('_', ' ')
+            st.write(f"**{count}** — {title}")
+
+
 def _resolve_ciissversions_from_args(argv):
     """Resolve supported_ciissversions tuple with precedence:
     --ciiss-versions flag > CIISS_VERSIONS env var > SUPPORTED_CIISSVERSIONS_DEFAULT.
@@ -149,23 +231,12 @@ def interactive_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
             color = "🟢" if stats['success_rate'] >= 80 else "🟡" if stats['success_rate'] >= 50 else "🔴"
             st.metric("Success Rate", f"{color} {stats['success_rate']:.1f}%")
         
-        # Proof type breakdown
-        st.subheader("🔍 Proof Type Analysis")
-        proof_types = stats['proof_types']
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            dns = proof_types['dns_rsa']
-            if dns['total'] > 0:
-                st.write(f"**DNS-RSA**: {dns['valid']}/{dns['total']} ({dns['success_rate']:.1f}%)")
-        with col2:
-            uri = proof_types['uri_rsa']
-            if uri['total'] > 0:
-                st.write(f"**URI-RSA**: {uri['valid']}/{uri['total']} ({uri['success_rate']:.1f}%)")
-        with col3:
-            no_proof = proof_types['no_proof']
-            if no_proof['total'] > 0:
-                st.write(f"**No Proof**: {no_proof['total']}")
+        # Proof type breakdown — render all populated proof types dynamically
+        # so v3 buckets surface alongside v2 without hardcoded rows.
+        _render_proof_types_panel(st, stats)
+
+        # ciissversion adoption + v3 failure category breakdown
+        _render_ciissversion_panel(st, stats)
         
         # Results table
         st.subheader("📋 Detailed Results")
@@ -303,12 +374,17 @@ def viewer_mode():
         st.metric("Valid AROI", stats.get('valid_relays', 0))
     with col3:
         st.metric("Success Rate", f"{stats.get('success_rate', 0):.1f}%")
-    
+
+    # Proof type + ciissversion panels (defensive: skip silently for older
+    # JSON without the new stats fields, per shape stability for archives)
+    _render_proof_types_panel(st, stats)
+    _render_ciissversion_panel(st, stats)
+
     # Results table
     st.subheader("Detailed Results")
     df = results_to_dataframe(data.get('results', []), include_error=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
-    
+
     # 1AEO Footer
     render_1aeo_footer()
 

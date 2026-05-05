@@ -288,6 +288,7 @@ ed25519 family ID, not an RSA fingerprint, is being verified).
 | `DNS-FamilyID: Invalid domain in url field: <url>` | `invalid_url` |
 | `DNS-FamilyID: Relay has no family_ids in Onionoo, cannot verify ciissversion:<N> proof` | `missing_family_ids` |
 | `DNS-FamilyID: TXT record not found at <domain>` | `dns_txt_missing` |
+| `DNS-FamilyID: Lookup failed, no TXT record answer for <domain>` | `dns_txt_missing` |
 | `DNS-FamilyID: TXT record content does not match relay family_ids. Expected one of: <ids>, found: <records>` (`+ " (case mismatch detected — spec requires case-sensitive match)"` when applicable) | `dns_content_mismatch` |
 | `DNS-FamilyID: Lookup failed: <error>` | `transport_error` |
 

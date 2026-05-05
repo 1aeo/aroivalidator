@@ -393,6 +393,13 @@ class ParallelAROIValidator:
                 condition = self._domain_conditions[cache_key]
                 wait_success = condition.wait(timeout=DEFAULT_TIMEOUT_SECONDS + 1.0)
                 if not wait_success:
+                    # Timeout-takeover race: the original tester may finish
+                    # later and clobber this thread's eventual result. Low
+                    # probability (5s timeout window) and worst case is one
+                    # extra fetch, so we accept it to avoid a stuck thread
+                    # blocking everyone forever. If we ever observe this
+                    # firing in production, switch to a per-attempt-id token
+                    # to invalidate stale results.
                     logger.warning(f"Timeout waiting for cache entry {cache_key} - taking over")
                     self._domain_cache[cache_key]['status'] = 'pending'
                     return ('should_test', None)
@@ -690,6 +697,13 @@ class ParallelAROIValidator:
             # dns-familyid, this means the operator never published the
             # shared TXT — actionable error with hint.
             result['error'] = f"{label}: TXT record not found at {domain}"
+            result['error_category'] = 'dns_txt_missing'
+            return result
+        except dns.resolver.NoAnswer:
+            # NoAnswer: domain exists but has no TXT records at this name.
+            # Distinct from NXDOMAIN (the name itself is unresolvable).
+            # Wording matches README error reference.
+            result['error'] = f"{label}: Lookup failed, no TXT record answer for {domain}"
             result['error_category'] = 'dns_txt_missing'
             return result
         except (dns.resolver.Timeout, dns.resolver.NoNameservers) as e:
@@ -1307,9 +1321,14 @@ def calculate_statistics(results: List[Dict]) -> Dict:
         }
         for key, counts in proof_counters.items()
     }
-    # Ensure legacy v2 keys are always present for back-compat consumers.
-    for legacy_key in ('dns_rsa', 'uri_rsa'):
-        proof_types_block.setdefault(legacy_key, {'total': 0, 'valid': 0, 'success_rate': 0.0})
+    # Symmetric output: every proof type known to this build is always present
+    # (with zero counts if not observed). Lets downstream renderers iterate
+    # without needing "treat as optional" defensive code paths.
+    for (_v, ptype) in PROOF_SPECS.keys():
+        proof_types_block.setdefault(
+            ptype.replace('-', '_'),
+            {'total': 0, 'valid': 0, 'success_rate': 0.0},
+        )
 
     proof_types_block['no_proof'] = {
         'total': no_proof_total,
@@ -1366,9 +1385,15 @@ def format_migration_insights(stats: Dict, results: List[Dict]) -> str:
                 f"{info['valid']:>4} valid ({info['success_rate']:5.1f}%)"
             )
 
+    # Render failure categories. "Actionable" categories (operator can fix
+    # something specific) sort first by count desc; transport_error and
+    # ciissversion_unsupported are appended after as they're either
+    # transient/diagnostic or operator-policy-level rather than per-relay
+    # actionable. All non-zero categories are surfaced — none silently dropped.
     cats = stats.get('v3_failure_categories', {}) or {}
+    _NON_ACTIONABLE = ('transport_error', 'ciissversion_unsupported')
     actionable = sorted(
-        ((k, v) for k, v in cats.items() if v > 0 and k != 'transport_error' and k != 'ciissversion_unsupported'),
+        ((k, v) for k, v in cats.items() if v > 0 and k not in _NON_ACTIONABLE),
         key=lambda kv: -kv[1],
     )
     if actionable:
@@ -1381,12 +1406,16 @@ def format_migration_insights(stats: Dict, results: List[Dict]) -> str:
             lines.append(f"  {count:>4}  {title}")
             lines.append(f"        → {action}")
 
-    if cats.get('transport_error'):
+    for cat in _NON_ACTIONABLE:
+        count = cats.get(cat, 0)
+        if not count:
+            continue
+        info = CATEGORY_INFO.get(cat, {})
+        title = info.get('title') or cat
+        action = info.get('action') or "(see error detail)"
         lines.append("")
-        lines.append(
-            f"  {cats['transport_error']:>4}  ciissversion:3 proofs failing due to network/TLS/HTTP errors"
-        )
-        lines.append("        → inspect per-relay error for specifics (timeout, cert, etc.)")
+        lines.append(f"  {count:>4}  {title}")
+        lines.append(f"        → {action}")
 
     valid_v2 = sum(
         1 for r in results
