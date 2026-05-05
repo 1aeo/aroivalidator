@@ -1,6 +1,7 @@
 """
 Ultra-Simplified AROI Validator
-All-in-one application with parallel validation support
+All-in-one application with parallel validation support.
+Supports CIISS ContactInfo specification versions 2 and 3.
 """
 import sys
 import json
@@ -10,8 +11,39 @@ from datetime import datetime
 # Import branding components from dedicated module
 from branding import render_1aeo_navigation, render_1aeo_styles, render_1aeo_footer
 
+from aroi_validator import (
+    SUPPORTED_CIISSVERSIONS_DEFAULT,
+    ALL_KNOWN_CIISSVERSIONS,
+    parse_ciissversions_flag,
+)
 
-def interactive_mode():
+
+def _resolve_ciissversions_from_args(argv):
+    """Resolve supported_ciissversions tuple with precedence:
+    --ciiss-versions flag > CIISS_VERSIONS env var > SUPPORTED_CIISSVERSIONS_DEFAULT.
+
+    Returns a validated tuple of version strings.
+    """
+    flag_value = None
+    if "--ciiss-versions" in argv:
+        idx = argv.index("--ciiss-versions") + 1
+        if idx < len(argv):
+            flag_value = argv[idx]
+
+    env_value = os.environ.get('CIISS_VERSIONS')
+
+    raw = flag_value if flag_value is not None else env_value
+    if raw is None:
+        return tuple(SUPPORTED_CIISSVERSIONS_DEFAULT)
+
+    try:
+        return parse_ciissversions_flag(raw)
+    except ValueError as e:
+        print(f"error: invalid ciissversions: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def interactive_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
     """Interactive validation mode with Streamlit UI"""
     import streamlit as st
     from aroi_validator import (
@@ -37,6 +69,8 @@ def interactive_mode():
         st.session_state.validation_in_progress = False
     if 'validation_stopped' not in st.session_state:
         st.session_state.validation_stopped = False
+    if 'supported_ciissversions' not in st.session_state:
+        st.session_state.supported_ciissversions = list(supported_ciissversions)
     
     # Helper functions
     def start_validation():
@@ -78,7 +112,11 @@ def interactive_mode():
                 stop_check=stop_check,
                 limit=limit,
                 parallel=use_parallel,
-                max_workers=max_workers
+                max_workers=max_workers,
+                supported_ciissversions=tuple(
+                    st.session_state.get('supported_ciissversions',
+                                          list(SUPPORTED_CIISSVERSIONS_DEFAULT))
+                ),
             )
             
             st.session_state.validation_results = results
@@ -168,7 +206,18 @@ def interactive_mode():
             step=10,
             help="Limit the number of relays to validate (0 = validate all)"
         )
-        
+
+        st.session_state.supported_ciissversions = st.multiselect(
+            "Validate ciissversion",
+            options=list(ALL_KNOWN_CIISSVERSIONS),
+            default=list(st.session_state.get(
+                'supported_ciissversions',
+                list(SUPPORTED_CIISSVERSIONS_DEFAULT)
+            )),
+            help="Uncheck a ciissversion to skip relays that declare it. "
+                 "Default seeded from --ciiss-versions CLI flag.",
+        )
+
         st.divider()
         
         # Validation controls
@@ -292,40 +341,42 @@ def _get_validated_env_int(name: str, default: int, min_val: int, max_val: int) 
         return default
 
 
-def batch_mode():
+def batch_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
     """Batch validation mode for automation"""
     from aroi_validator import (
         run_validation, calculate_statistics, save_results
     )
-    
+
     print("AROI Batch Validator (Parallel Processing)")
     print("=" * 50)
     print(f"Starting validation at {datetime.now().isoformat()}")
-    
+    print(f"Validating ciissversions: {','.join(supported_ciissversions)}")
+
     # Configuration from environment with validation
     limit = _get_validated_env_int('BATCH_LIMIT', default=100, min_val=0, max_val=50000)
     max_workers = _get_validated_env_int('MAX_WORKERS', default=10, min_val=1, max_val=100)
-    
+
     # Convert 0 to None for "all relays" (consistent with interactive mode)
     effective_limit = None if limit == 0 else limit
-    
+
     parallel_str = os.environ.get('PARALLEL', 'true').lower()
     use_parallel = parallel_str in ('true', '1', 'yes', 'on')
-    
+
     if use_parallel:
         print(f"Using parallel processing with {max_workers} workers")
-    
+
     # Progress callback
     def progress_callback(current, total, result):
         status = "✓" if result['valid'] else "✗"
         print(f"[{current}/{total}] {status} {result.get('nickname', 'Unknown')}")
-    
+
     # Run validation
     results = run_validation(
         progress_callback=progress_callback,
         limit=effective_limit,
         parallel=use_parallel,
-        max_workers=max_workers
+        max_workers=max_workers,
+        supported_ciissversions=supported_ciissversions,
     )
     
     # Save and report
@@ -351,20 +402,23 @@ def batch_mode():
 def main():
     """Main entry point with mode selection"""
     mode = "interactive"
-    
+
     # Check for command line mode
     if "--mode" in sys.argv:
         mode_index = sys.argv.index("--mode") + 1
         if mode_index < len(sys.argv):
             mode = sys.argv[mode_index]
-    
+
+    # Resolve supported ciissversions from --ciiss-versions flag or env var.
+    supported_ciissversions = _resolve_ciissversions_from_args(sys.argv)
+
     # Route to appropriate mode
     if mode == "batch":
-        batch_mode()
+        batch_mode(supported_ciissversions=supported_ciissversions)
     elif mode == "viewer":
         viewer_mode()
     else:
-        interactive_mode()
+        interactive_mode(supported_ciissversions=supported_ciissversions)
 
 
 if __name__ == "__main__":
