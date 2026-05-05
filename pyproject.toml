@@ -10,3 +10,11 @@ dependencies = [
     "streamlit>=1.45.1",
     "urllib3>=2.4.0",
 ]
+
+[tool.pytest.ini_options]
+# Default: pytest discovers and runs the mocked-input tests in tests/.
+# The live-network regression script (validate_known_v3_operators.py) is
+# named without a leading 'test_' prefix so it's NOT auto-collected;
+# invoke it explicitly with `python3 tests/validate_known_v3_operators.py`.
+testpaths = ["tests"]
+python_files = ["test_*.py"]

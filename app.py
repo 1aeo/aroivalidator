@@ -1,6 +1,7 @@
 """
 Ultra-Simplified AROI Validator
-All-in-one application with parallel validation support
+All-in-one application with parallel validation support.
+Supports CIISS ContactInfo specification versions 2 and 3.
 """
 import sys
 import json
@@ -10,8 +11,137 @@ from datetime import datetime
 # Import branding components from dedicated module
 from branding import render_1aeo_navigation, render_1aeo_styles, render_1aeo_footer
 
+from aroi_validator import (
+    SUPPORTED_CIISSVERSIONS_DEFAULT,
+    ALL_KNOWN_CIISSVERSIONS,
+    parse_ciissversions_flag,
+)
 
-def interactive_mode():
+
+# Pretty labels for proof_types stats keys. Anything not in this dict falls
+# back to the raw key.
+_PROOF_TYPE_LABELS = {
+    'dns_rsa': 'DNS-RSA (ciissversion:2)',
+    'uri_rsa': 'URI-RSA (ciissversion:2)',
+    'dns_familyid_ed25519': 'DNS-FamilyID (ciissversion:3)',
+    'uri_familyid_ed25519': 'URI-FamilyID (ciissversion:3)',
+}
+
+
+def _render_proof_types_panel(st, stats):
+    """Render proof_types breakdown surfacing every populated proof type
+    (v2 + v3). Skips zero-count entries to keep the panel tight."""
+    st.subheader("🔍 Proof Type Analysis")
+    proof_types = stats.get('proof_types', {}) or {}
+
+    # Stable ordering: v2 first (dns_rsa, uri_rsa), then v3, then no_proof
+    order = ('dns_rsa', 'uri_rsa', 'dns_familyid_ed25519', 'uri_familyid_ed25519')
+    rendered = 0
+    for key in order:
+        info = proof_types.get(key)
+        if not info or info.get('total', 0) == 0:
+            continue
+        label = _PROOF_TYPE_LABELS.get(key, key)
+        st.write(
+            f"**{label}**: {info['valid']}/{info['total']} "
+            f"({info.get('success_rate', 0):.1f}%)"
+        )
+        rendered += 1
+
+    no_proof = proof_types.get('no_proof', {}) or {}
+    if no_proof.get('total', 0) > 0:
+        # Sub-breakdown when both v2-no-AROI and v3-informational-only are
+        # present; otherwise just show the total.
+        total = no_proof['total']
+        no_aroi = no_proof.get('no_aroi', total)
+        v3_no_url = no_proof.get('ciissversion3_no_url', 0)
+        if v3_no_url:
+            st.write(
+                f"**No Proof**: {total} "
+                f"(no AROI: {no_aroi}, ciissversion:3 informational-only: {v3_no_url})"
+            )
+        else:
+            st.write(f"**No Proof**: {total}")
+        rendered += 1
+
+    if rendered == 0:
+        st.info("No proof type data in this result set.")
+
+
+def _render_ciissversion_panel(st, stats):
+    """Render ciissversion adoption + v3 failure category breakdown.
+
+    Only renders when ciissversion data is present (older JSON without
+    ciissversion_declared just gets skipped — defensive for back-compat
+    with pre-schema-v2 saved results)."""
+    declared = stats.get('ciissversion_declared')
+    if not declared:
+        return
+
+    st.subheader("📐 ciissversion Adoption")
+    cols = st.columns(3)
+    cols[0].metric("ciissversion:2", declared.get('2', 0))
+    cols[1].metric("ciissversion:3", declared.get('3', 0))
+    cols[2].metric("none", declared.get('none', 0))
+
+    # v3 failure categories — only render the section if any non-zero counts
+    cats = stats.get('v3_failure_categories') or {}
+    nonzero = [(k, v) for k, v in cats.items() if v > 0]
+    if not nonzero:
+        return
+
+    nonzero.sort(key=lambda kv: -kv[1])
+    with st.expander(
+        f"🚧 ciissversion:3 migration health ({sum(v for _, v in nonzero)} relays with issues)"
+    ):
+        for cat, count in nonzero:
+            # Pretty-format the category name; show count with action hint
+            title = cat.replace('_', ' ')
+            st.write(f"**{count}** — {title}")
+
+
+def _resolve_ciissversions_from_args(argv):
+    """Resolve supported_ciissversions tuple with precedence:
+    --ciiss-versions flag > CIISS_VERSIONS env var > SUPPORTED_CIISSVERSIONS_DEFAULT.
+
+    Accepts both separated (`--ciiss-versions 2,3`) and combined
+    (`--ciiss-versions=2,3`) flag forms. Returns a validated tuple.
+    """
+    flag_value = None
+    # Combined form: --ciiss-versions=value (first match wins)
+    for token in argv:
+        if token.startswith("--ciiss-versions="):
+            flag_value = token.split("=", 1)[1]
+            break
+    # Separated form: --ciiss-versions value (only if combined wasn't found)
+    if flag_value is None and "--ciiss-versions" in argv:
+        idx = argv.index("--ciiss-versions") + 1
+        if idx >= len(argv):
+            # Flag present with no value — fail loudly rather than silently
+            # falling back to env / defaults. Operators reading the cron log
+            # would otherwise wonder why their flag was ignored.
+            print(
+                "error: --ciiss-versions requires a value (e.g. --ciiss-versions 2,3 "
+                "or --ciiss-versions=2,3)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        flag_value = argv[idx]
+
+    env_value = os.environ.get('CIISS_VERSIONS')
+
+    raw = flag_value if flag_value is not None else env_value
+    if raw is None:
+        return tuple(SUPPORTED_CIISSVERSIONS_DEFAULT)
+
+    try:
+        return parse_ciissversions_flag(raw)
+    except ValueError as e:
+        print(f"error: invalid ciissversions: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def interactive_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
     """Interactive validation mode with Streamlit UI"""
     import streamlit as st
     from aroi_validator import (
@@ -37,6 +167,8 @@ def interactive_mode():
         st.session_state.validation_in_progress = False
     if 'validation_stopped' not in st.session_state:
         st.session_state.validation_stopped = False
+    if 'supported_ciissversions' not in st.session_state:
+        st.session_state.supported_ciissversions = list(supported_ciissversions)
     
     # Helper functions
     def start_validation():
@@ -78,7 +210,11 @@ def interactive_mode():
                 stop_check=stop_check,
                 limit=limit,
                 parallel=use_parallel,
-                max_workers=max_workers
+                max_workers=max_workers,
+                supported_ciissversions=tuple(
+                    st.session_state.get('supported_ciissversions',
+                                          list(SUPPORTED_CIISSVERSIONS_DEFAULT))
+                ),
             )
             
             st.session_state.validation_results = results
@@ -111,23 +247,12 @@ def interactive_mode():
             color = "🟢" if stats['success_rate'] >= 80 else "🟡" if stats['success_rate'] >= 50 else "🔴"
             st.metric("Success Rate", f"{color} {stats['success_rate']:.1f}%")
         
-        # Proof type breakdown
-        st.subheader("🔍 Proof Type Analysis")
-        proof_types = stats['proof_types']
-        
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            dns = proof_types['dns_rsa']
-            if dns['total'] > 0:
-                st.write(f"**DNS-RSA**: {dns['valid']}/{dns['total']} ({dns['success_rate']:.1f}%)")
-        with col2:
-            uri = proof_types['uri_rsa']
-            if uri['total'] > 0:
-                st.write(f"**URI-RSA**: {uri['valid']}/{uri['total']} ({uri['success_rate']:.1f}%)")
-        with col3:
-            no_proof = proof_types['no_proof']
-            if no_proof['total'] > 0:
-                st.write(f"**No Proof**: {no_proof['total']}")
+        # Proof type breakdown — render all populated proof types dynamically
+        # so v3 buckets surface alongside v2 without hardcoded rows.
+        _render_proof_types_panel(st, stats)
+
+        # ciissversion adoption + v3 failure category breakdown
+        _render_ciissversion_panel(st, stats)
         
         # Results table
         st.subheader("📋 Detailed Results")
@@ -168,7 +293,27 @@ def interactive_mode():
             step=10,
             help="Limit the number of relays to validate (0 = validate all)"
         )
-        
+
+        _selected = st.multiselect(
+            "Validate ciissversion",
+            options=list(ALL_KNOWN_CIISSVERSIONS),
+            default=list(st.session_state.get(
+                'supported_ciissversions',
+                list(SUPPORTED_CIISSVERSIONS_DEFAULT)
+            )),
+            help="Uncheck a ciissversion to skip relays that declare it. "
+                 "Default seeded from --ciiss-versions CLI flag.",
+        )
+        if not _selected:
+            # An empty selection would make every relay 'unsupported'. Warn
+            # and revert to the default set so validation still runs.
+            st.warning(
+                "Empty ciissversion selection is not allowed. "
+                "Reverting to defaults."
+            )
+            _selected = list(SUPPORTED_CIISSVERSIONS_DEFAULT)
+        st.session_state.supported_ciissversions = _selected
+
         st.divider()
         
         # Validation controls
@@ -254,12 +399,17 @@ def viewer_mode():
         st.metric("Valid AROI", stats.get('valid_relays', 0))
     with col3:
         st.metric("Success Rate", f"{stats.get('success_rate', 0):.1f}%")
-    
+
+    # Proof type + ciissversion panels (defensive: skip silently for older
+    # JSON without the new stats fields, per shape stability for archives)
+    _render_proof_types_panel(st, stats)
+    _render_ciissversion_panel(st, stats)
+
     # Results table
     st.subheader("Detailed Results")
     df = results_to_dataframe(data.get('results', []), include_error=False)
     st.dataframe(df, use_container_width=True, hide_index=True)
-    
+
     # 1AEO Footer
     render_1aeo_footer()
 
@@ -292,40 +442,42 @@ def _get_validated_env_int(name: str, default: int, min_val: int, max_val: int) 
         return default
 
 
-def batch_mode():
+def batch_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
     """Batch validation mode for automation"""
     from aroi_validator import (
         run_validation, calculate_statistics, save_results
     )
-    
+
     print("AROI Batch Validator (Parallel Processing)")
     print("=" * 50)
     print(f"Starting validation at {datetime.now().isoformat()}")
-    
+    print(f"Validating ciissversions: {','.join(supported_ciissversions)}")
+
     # Configuration from environment with validation
     limit = _get_validated_env_int('BATCH_LIMIT', default=100, min_val=0, max_val=50000)
     max_workers = _get_validated_env_int('MAX_WORKERS', default=10, min_val=1, max_val=100)
-    
+
     # Convert 0 to None for "all relays" (consistent with interactive mode)
     effective_limit = None if limit == 0 else limit
-    
+
     parallel_str = os.environ.get('PARALLEL', 'true').lower()
     use_parallel = parallel_str in ('true', '1', 'yes', 'on')
-    
+
     if use_parallel:
         print(f"Using parallel processing with {max_workers} workers")
-    
+
     # Progress callback
     def progress_callback(current, total, result):
         status = "✓" if result['valid'] else "✗"
         print(f"[{current}/{total}] {status} {result.get('nickname', 'Unknown')}")
-    
+
     # Run validation
     results = run_validation(
         progress_callback=progress_callback,
         limit=effective_limit,
         parallel=use_parallel,
-        max_workers=max_workers
+        max_workers=max_workers,
+        supported_ciissversions=supported_ciissversions,
     )
     
     # Save and report
@@ -351,20 +503,38 @@ def batch_mode():
 def main():
     """Main entry point with mode selection"""
     mode = "interactive"
-    
-    # Check for command line mode
-    if "--mode" in sys.argv:
-        mode_index = sys.argv.index("--mode") + 1
-        if mode_index < len(sys.argv):
-            mode = sys.argv[mode_index]
-    
+
+    # Accept both --mode <value> and --mode=<value>. Combined form match wins.
+    combined = next(
+        (t for t in sys.argv if t.startswith("--mode=")),
+        None,
+    )
+    if combined is not None:
+        mode = combined.split("=", 1)[1]
+    elif "--mode" in sys.argv:
+        idx = sys.argv.index("--mode") + 1
+        if idx >= len(sys.argv):
+            # Flag present with no value — fail loudly rather than silently
+            # defaulting to interactive. (Same defensive pattern as
+            # _resolve_ciissversions_from_args.)
+            print(
+                "error: --mode requires a value "
+                "(interactive | batch | viewer | insights)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        mode = sys.argv[idx]
+
+    # Resolve supported ciissversions from --ciiss-versions flag or env var.
+    supported_ciissversions = _resolve_ciissversions_from_args(sys.argv)
+
     # Route to appropriate mode
     if mode == "batch":
-        batch_mode()
+        batch_mode(supported_ciissversions=supported_ciissversions)
     elif mode == "viewer":
         viewer_mode()
     else:
-        interactive_mode()
+        interactive_mode(supported_ciissversions=supported_ciissversions)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,14 @@
 """
 AROI Validator with Parallel Processing Support
-Simplified and optimized version with parallel validation capability
+Supports CIISS ContactInfo specification versions 2 and 3.
+
+CIISS spec: https://nusenu.github.io/ContactInfo-Information-Sharing-Specification/
+- ciissversion:2 — proof types: dns-rsa, uri-rsa (verifies relay RSA fingerprint)
+- ciissversion:3 — proof types: dns-familyid-ed25519, uri-familyid-ed25519
+                   (verifies operator's ed25519 family ID against relay.family_ids)
 """
 import concurrent.futures
+import ipaddress
 import json
 import logging
 import re
@@ -12,7 +18,7 @@ import string
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable, Sequence, Tuple
 from urllib.parse import urlparse
 
 import dns.resolver
@@ -20,31 +26,35 @@ import requests
 import urllib3
 
 # Suppress SSL warnings when certificate verification is disabled
-# This is expected behavior for this tool - see Security Notes in README
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Configure logging for security events
 logger = logging.getLogger(__name__)
 
 # Pre-computed constants for filename validation
 _ALLOWED_FILENAME_CHARS = frozenset(string.ascii_letters + string.digits + '._-')
 _MAX_WORKERS_LIMIT = 100
 
-# Default configuration constants (DRY - single source of truth)
+# Default configuration constants
 DEFAULT_VERIFY_CERTIFICATES = True
 DEFAULT_ALLOW_LEGACY_TLS = True
-DEFAULT_MAX_RETRIES = 0  # No per-request retries - domain gets multiple attempts via cache
-DEFAULT_TIMEOUT_SECONDS = 5  # 5s timeout per attempt
-DEFAULT_DOMAIN_MAX_ATTEMPTS = 3  # Reduced from 10: 3 consecutive failures is enough to mark domain bad
+DEFAULT_MAX_RETRIES = 0
+DEFAULT_TIMEOUT_SECONDS = 5
+DEFAULT_DOMAIN_MAX_ATTEMPTS = 3
 
-# Proof type constants (DRY - avoid magic strings)
+# aroivalidator output schema version. Bumped when we add stats keys, per-result
+# fields, or change semantic shape. NOT a CIISS spec version.
+AROIVALIDATOR_SCHEMA_VERSION = 2
+
+# Proof type constants (existing, retained for backward compatibility)
 PROOF_TYPE_DNS_RSA = "dns-rsa"
 PROOF_TYPE_URI_RSA = "uri-rsa"
+PROOF_TYPE_DNS_FAMILYID_ED25519 = "dns-familyid-ed25519"
+PROOF_TYPE_URI_FAMILYID_ED25519 = "uri-familyid-ed25519"
 
-# Connectivity error indicators (DRY - used for cache decisions)
+# Connectivity error indicators (used for cache decisions)
 _CONNECTIVITY_ERROR_PATTERNS = ('timed out', 'connection refused', 'connection reset', 'connection error')
 
-# Pre-compiled regex patterns for AROI field parsing (efficiency)
+# Pre-compiled regex patterns for AROI field parsing
 _AROI_PATTERNS = {
     'ciissversion': re.compile(r'\bciissversion:(\S+)', re.IGNORECASE),
     'proof': re.compile(r'\bproof:(\S+)', re.IGNORECASE),
@@ -52,35 +62,568 @@ _AROI_PATTERNS = {
     'email': re.compile(r'\bemail:(\S+)', re.IGNORECASE),
 }
 
+# Tor secret key file header pattern. Used to detect operators who paste
+# .secret_family_key contents instead of .public_family_id (security incident).
+_SECRET_KEY_HEADER_RE = re.compile(r'ed25519.*(secret|private)', re.IGNORECASE)
+_SECRET_KEY_LENGTH_THRESHOLD = 200  # public_family_id is 43 chars; anything >200 is suspicious
+
+
+def _norm_family_ids(relay: Dict[str, Any]) -> set:
+    """Normalize family_ids from Onionoo (strip whitespace, drop empties).
+    Case is preserved — CIISS v3 spec mandates 43-char case-sensitive match."""
+    return {s.strip() for s in (relay.get('family_ids') or []) if s and s.strip()}
+
+
+def _tokenize_proof(content: Any, kind: str) -> set:
+    """Parse fetched proof content into a comparable token set.
+
+    Single source of truth used by:
+      - PROOF_SPECS[*]['matches'] callbacks
+      - _finalize_match content-mismatch error formatting
+      - _case_mismatch_only diagnostic
+
+    Args:
+        content: list[str] for DNS (TXT records); str for URI (response.text).
+        kind: 'dns' or 'uri'.
+
+    Returns:
+        Set of stripped tokens. Comments (lines starting with '#') skipped for
+        URI content. Case preserved — callers handle case-(in)sensitive comparison.
+    """
+    if kind == 'dns':
+        return {r.strip() for r in (content or []) if r and r.strip()}
+    # 'uri': response.text → split lines, skip blanks and comments
+    return {
+        l.strip() for l in (content or '').splitlines()
+        if l.strip() and not l.strip().startswith('#')
+    }
+
+
+# ============================================================================
+# SSRF protection
+# ============================================================================
+# Relay ContactInfo `url:` is operator-provided and untrusted. v3 URI proofs
+# fetch https://<that-host>/.well-known/... — without protection, a malicious
+# operator could point us at loopback (127.0.0.1), link-local
+# (169.254.169.254 cloud metadata), or RFC1918 private addresses, or chain a
+# public host via an HTTP redirect to one of those. Two-layer mitigation:
+#   1. Reject IP-literal hostnames outright.
+#   2. Resolve the hostname (A + AAAA) and reject if any answer is in a
+#      private/loopback/link-local/reserved/multicast/unspecified range.
+#   3. Disable HTTP redirects entirely (the spec also says proof URIs MUST
+#      NOT redirect).
+# This still has a TOCTOU window between our resolve and requests' resolve,
+# but it catches the vast majority of real-world SSRF and meets the defensive
+# bar for a CI/hosted deployment of the validator.
+
+# Cache resolved-safe results per validator run so we don't double-resolve.
+_HOST_SAFETY_CACHE: Dict[str, Tuple[bool, str]] = {}
+_HOST_SAFETY_LOCK = threading.Lock()
+
+
+def _ip_is_safe(ip: str) -> bool:
+    """Return True if the IP is a globally-routable unicast address.
+
+    Deny-by-default predicate built on `is_global`: only addresses Python
+    classifies as globally routable AND not multicast pass. This catches:
+      - all of is_loopback / is_private / is_link_local / is_reserved /
+        is_unspecified (none of these are is_global)
+      - CGN / shared address space (100.64.0.0/10, RFC6598) — Python
+        considers this not-global despite is_private being False
+      - benchmarking (198.18.0.0/15)
+      - TEST-NET-* documentation prefixes (192.0.2.0/24, 198.51.100.0/24,
+        203.0.113.0/24)
+      - IETF protocol assignments (192.0.0.0/24)
+    AND additionally rejects multicast, which Python's is_global flag
+    surprisingly returns True for despite being unsuitable as a unicast
+    HTTPS target.
+    """
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return bool(ip_obj.is_global) and not ip_obj.is_multicast
+
+
+def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
+    """Check whether hostname is safe to HTTPS-fetch.
+
+    Rejects IP-literal hostnames outright, then resolves A/AAAA and rejects
+    if any resolved address is in a private/loopback/link-local/reserved/
+    multicast/unspecified range. Result cached per validator run.
+
+    Returns:
+        (safe: bool, reason: str). reason is the rejection cause when
+        safe=False, or the resolved IP for diagnostic logging when safe=True.
+    """
+    if not hostname:
+        return False, "empty hostname"
+
+    with _HOST_SAFETY_LOCK:
+        if hostname in _HOST_SAFETY_CACHE:
+            return _HOST_SAFETY_CACHE[hostname]
+
+    # 1. Reject IP-literal hostnames. ContactInfo `url:` should be a domain,
+    #    not an IP. CIISS spec describes URLs / FQDNs.
+    try:
+        ipaddress.ip_address(hostname)
+        result = (False, "url is an IP literal, not a domain")
+        with _HOST_SAFETY_LOCK:
+            _HOST_SAFETY_CACHE[hostname] = result
+        return result
+    except ValueError:
+        pass  # Not an IP literal — good.
+
+    # 2. Resolve the hostname and check every returned address.
+    try:
+        infos = socket.getaddrinfo(
+            hostname, None,
+            type=socket.SOCK_STREAM,
+        )
+    except (socket.gaierror, OSError) as e:
+        # Couldn't resolve — let the actual fetch fail with a meaningful
+        # transport error. Don't cache, in case it's transient.
+        return True, f"unresolved (defer to fetch): {e}"
+
+    ips = {info[4][0] for info in infos}
+    if not ips:
+        result = (False, "no A/AAAA records resolved")
+        with _HOST_SAFETY_LOCK:
+            _HOST_SAFETY_CACHE[hostname] = result
+        return result
+
+    unsafe = [ip for ip in ips if not _ip_is_safe(ip)]
+    if unsafe:
+        result = (False, f"resolves to non-public address(es): {','.join(sorted(unsafe))}")
+        with _HOST_SAFETY_LOCK:
+            _HOST_SAFETY_CACHE[hostname] = result
+        return result
+
+    result = (True, ','.join(sorted(ips)))
+    with _HOST_SAFETY_LOCK:
+        _HOST_SAFETY_CACHE[hostname] = result
+    return result
+
+
+def _clear_host_safety_cache() -> None:
+    """Clear the host-safety cache. Called between validation runs."""
+    with _HOST_SAFETY_LOCK:
+        _HOST_SAFETY_CACHE.clear()
+
+
+# ----------------------------------------------------------------------------
+# DNS-rebinding-safe connection layer
+# ----------------------------------------------------------------------------
+# The pre-flight is_safe_public_host() check is necessary but NOT sufficient:
+# an attacker who controls the authoritative DNS for url:<their-domain> can
+# return a public IP for the safety lookup, then return 127.0.0.1 (or the
+# AWS metadata IP, or RFC1918) when `requests` does its own resolution for
+# the actual fetch. To close that DNS-rebinding window, we replace urllib3's
+# connection-time create_connection with one that:
+#   1. Does its own atomic getaddrinfo at connect time.
+#   2. Filters returned addrinfos through _ip_is_safe.
+#   3. Connects only to IPs that survived the filter.
+#   4. Fails closed (raises) if no safe IPs remain.
+# This function is what actually opens the socket the HTTPS request uses,
+# so there is no resolve→connect window left for an attacker.
+
+class SSRFBlockedError(OSError):
+    """Raised when a connection target resolves to a non-public address."""
+
+
+def _safe_create_connection(
+    address,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,  # type: ignore[attr-defined]
+    source_address=None,
+    socket_options=None,
+):
+    """create_connection variant that refuses non-globally-routable targets.
+
+    Mirrors urllib3.util.connection.create_connection but inserts an
+    address-filter step between getaddrinfo and connect. Raises
+    SSRFBlockedError (an OSError subclass so urllib3 wraps it as a
+    NewConnectionError) if every resolved address fails _ip_is_safe.
+    """
+    host, port = address
+    if isinstance(host, str) and host.startswith("["):
+        host = host.strip("[]")
+
+    # Reject IP-literal hosts outright. (urllib3 may pass us a literal if
+    # the URL was https://1.2.3.4/...; defense-in-depth.)
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if not _ip_is_safe(host):
+            raise SSRFBlockedError(
+                f"SSRF-blocked: refusing to connect to non-public IP literal {host}"
+            )
+        # If host is itself a safe IP literal, fall through to the loop below
+        # which will hit the same address via getaddrinfo's passthrough.
+        del ip_obj
+    except ValueError:
+        pass  # not an IP literal, normal hostname
+
+    err = None
+    safe_seen = False
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise  # surface as urllib3 NameResolutionError
+
+    for af, socktype, proto, _canon, sa in infos:
+        ip_str = sa[0]
+        if not _ip_is_safe(ip_str):
+            err = err or SSRFBlockedError(
+                f"SSRF-blocked: refusing to connect to non-public address "
+                f"{ip_str} for host {host}"
+            )
+            continue
+        safe_seen = True
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            if socket_options:
+                for opt in socket_options:
+                    sock.setsockopt(*opt)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:  # type: ignore[attr-defined]
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as e:
+            err = e
+            if sock is not None:
+                sock.close()
+
+    # Fail closed: if every addr was unsafe, raise SSRFBlockedError; if
+    # the only failures were transport-level errors (or the list was
+    # empty), surface those.
+    if not safe_seen:
+        raise SSRFBlockedError(
+            f"SSRF-blocked: no globally-routable address available for {host}"
+        )
+    if err is not None:
+        raise err
+    raise OSError(f"getaddrinfo returned no addresses for {host}")
+
+
+# urllib3 connection subclasses that route through _safe_create_connection.
+# Subclassing rather than monkey-patching keeps the SSRF gate scoped to the
+# adapter we install on the relay-fetch session — Onionoo connections (which
+# use a different session config / well-known torproject.org host) are not
+# affected.
+from urllib3.connection import HTTPConnection as _Urllib3HTTPConnection
+from urllib3.connection import HTTPSConnection as _Urllib3HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool as _Urllib3HTTPConnectionPool
+from urllib3.connectionpool import HTTPSConnectionPool as _Urllib3HTTPSConnectionPool
+from urllib3.poolmanager import PoolManager as _Urllib3PoolManager
+
+
+class _SSRFSafeHTTPConnection(_Urllib3HTTPConnection):
+    def _new_conn(self):
+        from urllib3.exceptions import NameResolutionError, NewConnectionError
+        try:
+            sock = _safe_create_connection(
+                (self._dns_host, self.port),
+                self.timeout,
+                source_address=self.source_address,
+                socket_options=self.socket_options,
+            )
+        except SSRFBlockedError as e:
+            # Surface as a NewConnectionError so the requests layer gets
+            # a ConnectionError (not a generic OSError); the message is
+            # what user code reads.
+            raise NewConnectionError(self, str(e)) from e
+        except socket.gaierror as e:
+            raise NameResolutionError(self.host, self, e) from e
+        return sock
+
+
+class _SSRFSafeHTTPSConnection(_Urllib3HTTPSConnection):
+    def _new_conn(self):
+        from urllib3.exceptions import NameResolutionError, NewConnectionError
+        try:
+            sock = _safe_create_connection(
+                (self._dns_host, self.port),
+                self.timeout,
+                source_address=self.source_address,
+                socket_options=self.socket_options,
+            )
+        except SSRFBlockedError as e:
+            raise NewConnectionError(self, str(e)) from e
+        except socket.gaierror as e:
+            raise NameResolutionError(self.host, self, e) from e
+        return sock
+
+
+class _SSRFSafeHTTPConnectionPool(_Urllib3HTTPConnectionPool):
+    ConnectionCls = _SSRFSafeHTTPConnection
+
+
+class _SSRFSafeHTTPSConnectionPool(_Urllib3HTTPSConnectionPool):
+    ConnectionCls = _SSRFSafeHTTPSConnection
+
+
+class _SSRFSafePoolManager(_Urllib3PoolManager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Override the per-scheme pool classes so every connection opened
+        # through this PoolManager uses our SSRF-safe _new_conn.
+        self.pool_classes_by_scheme = {
+            "http": _SSRFSafeHTTPConnectionPool,
+            "https": _SSRFSafeHTTPSConnectionPool,
+        }
+
+
+def _looks_like_secret_key(content_lines: List[str]) -> bool:
+    """Detect whether published proof content appears to contain .secret_family_key.
+
+    Heuristic: any line >200 chars OR matching Tor key-file header pattern.
+    A real public_family_id is exactly 43 chars; anything dramatically longer
+    or containing the key-type header is the operator's secret material.
+    """
+    for line in content_lines:
+        if not isinstance(line, str):
+            continue
+        if len(line) > _SECRET_KEY_LENGTH_THRESHOLD:
+            return True
+        if _SECRET_KEY_HEADER_RE.search(line):
+            return True
+    return False
+
+
+# ============================================================================
+# CATEGORY_INFO: single source of truth for error_category → operator guidance.
+# Used by _finalize_hint (per-result hint) AND format_migration_insights
+# (aggregate breakdown). Adding a category = one entry; retiring = one deletion.
+# ============================================================================
+
+CATEGORY_INFO: Dict[str, Dict[str, Optional[str]]] = {
+    'missing_family_ids': {
+        'hint': ("Run 'tor --keygen-family <file>' on the relay, configure "
+                 "Tor's happy-family directive to use <file>.secret_family_key, "
+                 "restart, and wait for Onionoo to refresh (typically < 24h)."),
+        'title': "ciissversion:3 relays missing family_ids in Onionoo",
+        'action': ("run 'tor --keygen-family', configure Tor, restart, "
+                   "wait 1 Onionoo cycle"),
+    },
+    'dns_txt_missing': {
+        'hint': ("Publish a TXT record at we-run-this-tor-ed25519-family-id."
+                 "<your-domain> containing the contents of your "
+                 ".public_family_id file (43 characters, case-sensitive). "
+                 "DNSSEC is required by the spec."),
+        'title': "ciissversion:3 DNS proofs with TXT record missing",
+        'action': "publish we-run-this-tor-ed25519-family-id.<domain> TXT record",
+    },
+    'dns_content_mismatch': {
+        'hint': ("The TXT record must contain the operator's public_family_id "
+                 "(from 'tor --keygen-family'). Never publish the "
+                 ".secret_family_key. During key rollover, both old and new "
+                 "public_family_id values may co-exist in the TXT record."),
+        'title': ("ciissversion:3 DNS proofs where TXT content doesn't match "
+                  "family_ids"),
+        'action': ("check TXT contains .public_family_id contents "
+                   "(NOT .secret_family_key)"),
+    },
+    'uri_file_missing': {
+        'hint': ("Publish https://<your-domain>/.well-known/tor-relay/"
+                 "ed25519-family-id.txt containing your public_family_id "
+                 "(43-char, case-sensitive). HTTPS only, trusted CA, "
+                 "no redirects."),
+        'title': "ciissversion:3 URI proofs with well-known file missing (404)",
+        'action': "publish /.well-known/tor-relay/ed25519-family-id.txt",
+    },
+    'uri_content_mismatch': {
+        'hint': ("File exists but does not contain this relay's family_id. "
+                 "Confirm you pasted the contents of your .public_family_id "
+                 "file (case matters). Never paste .secret_family_key."),
+        'title': ("ciissversion:3 URI proofs where file content doesn't match "
+                  "family_ids"),
+        'action': ("check file contains .public_family_id contents "
+                   "(NOT .secret_family_key)"),
+    },
+    'wrong_proof_type_rsa': {
+        'hint': ("ciissversion:3 requires proof:dns-familyid-ed25519 or "
+                 "proof:uri-familyid-ed25519. If you meant to stay on "
+                 "ciissversion:2, also keep ciissversion:2 (not 3)."),
+        'title': "ciissversion:3 relays declaring a ciissversion:2 proof type (dns-rsa/uri-rsa)",
+        'action': ("change ContactInfo proof to dns-familyid-ed25519 or "
+                   "uri-familyid-ed25519"),
+    },
+    'missing_proof_field': {
+        'hint': ("With ciissversion:3, 'proof' is mandatory whenever 'url' "
+                 "is set. Either add proof:dns-familyid-ed25519 or "
+                 "proof:uri-familyid-ed25519, or remove the url field."),
+        'title': "ciissversion:3 relays with 'url' set but 'proof' missing",
+        'action': ("add proof:dns-familyid-ed25519 or "
+                   "proof:uri-familyid-ed25519, or remove url"),
+    },
+    'invalid_url': {
+        'hint': ("The url field is not a parseable domain. Set url to your "
+                 "operator domain (with or without https:// prefix), e.g. "
+                 "url:example.com"),
+        'title': "ciissversion:3 relays with invalid url field",
+        'action': "fix the url field in ContactInfo to be a valid domain",
+    },
+    'unsafe_target': {
+        'hint': ("The url field points at an IP literal or a hostname "
+                 "resolving to a private/loopback/link-local address. "
+                 "Set url to a publicly-routable domain "
+                 "(operator's public website)."),
+        'title': "relays with url pointing at a non-public IP/host (SSRF-blocked)",
+        'action': "set url to a publicly-routable domain",
+    },
+    'redirect_disallowed': {
+        'hint': ("The .well-known proof URI returned an HTTP redirect. "
+                 "CIISS spec requires the proof endpoint to NOT redirect. "
+                 "Serve the file directly at /.well-known/tor-relay/"
+                 "ed25519-family-id.txt without 3xx redirects."),
+        'title': "ciissversion:3 URI proofs returning HTTP redirects",
+        'action': "remove redirects from the .well-known/tor-relay/ path",
+    },
+    'secret_key_leaked': {
+        'hint': ("SECURITY INCIDENT: the published content looks like "
+                 ".secret_family_key (Tor key header or >200 chars). "
+                 "ROTATE the family key NOW with 'tor --keygen-family "
+                 "<newfile>', replace the published value with the new "
+                 ".public_family_id, and update every relay's Tor config."),
+        'title': ("ciissversion:3 relays that appear to have published "
+                  ".secret_family_key"),
+        'action': ("SECURITY: rotate the family key IMMEDIATELY with "
+                   "'tor --keygen-family <newfile>'"),
+    },
+    'ciissversion_unsupported': {
+        'hint': None,  # error string already explains supported versions
+        'title': "relays declaring a ciissversion not enabled by this run",
+        'action': "(adjust --ciiss-versions, or operator should match supported list)",
+    },
+    'transport_error': {
+        'hint': None,  # the transport-level error string already carries detail
+        'title': "ciissversion:3 proofs failing due to network/TLS/HTTP errors",
+        'action': "inspect the per-relay error for specifics (timeout, cert, etc.)",
+    },
+}
+
+
+def _finalize_hint(result: dict) -> None:
+    """Attach hint to result by error_category tag.
+    Called at tail of validate_relay only for ciissversion:3 results."""
+    cat = result.get('error_category')
+    info = CATEGORY_INFO.get(cat) if cat else None
+    if info and info.get('hint'):
+        result['hint'] = info['hint']
+
+
+# ============================================================================
+# PROOF_SPECS: keyed by (ciissversion, proof_type). Single source of truth for
+# proof-type behaviour. Adding a proof type = one entry. Retiring a version =
+# remove that version's rows.
+# ============================================================================
+
+# Forward declaration; populated below the lambdas to keep them short.
+PROOF_SPECS: Dict[Tuple[str, str], Dict[str, Any]] = {
+    ('2', PROOF_TYPE_DNS_RSA): {
+        'kind': 'dns', 'label': 'DNS-RSA',
+        # v2 DNS query is per-relay: <rsa-fp>.<domain>
+        'locator': lambda relay, domain: f"{relay['fingerprint'].lower()}.{domain}",
+        'shared_proof': False,  # per-relay subdomain — cannot reuse success
+        'expected_desc': "'we-run-this-tor-relay'",
+        # v2 dns-rsa is special: substring search across raw records, not a
+        # tokenized set match (proof is literal text, not a per-token value).
+        'matches': lambda content, relay: any(
+            'we-run-this-tor-relay' in r.lower() for r in content),
+    },
+    ('2', PROOF_TYPE_URI_RSA): {
+        'kind': 'uri', 'label': 'URI-RSA',
+        'locator': lambda relay, domain: '/.well-known/tor-relay/rsa-fingerprint.txt',
+        'shared_proof': True,  # one file lists all relays
+        'expected_desc': 'relay RSA fingerprint',
+        # RSA fingerprints are case-insensitive hex
+        'matches': lambda content, relay: relay['fingerprint'].upper() in {
+            t.upper() for t in _tokenize_proof(content, 'uri')
+        },
+    },
+    ('3', PROOF_TYPE_DNS_FAMILYID_ED25519): {
+        'kind': 'dns', 'label': 'DNS-FamilyID',
+        'locator': lambda relay, domain: f"we-run-this-tor-ed25519-family-id.{domain}",
+        'shared_proof': True,
+        'expected_desc': 'relay family_ids (43-char ed25519)',
+        # Case-sensitive intersection (spec: 43-char case-sensitive)
+        'matches': lambda content, relay: bool(
+            _tokenize_proof(content, 'dns') & _norm_family_ids(relay)),
+    },
+    ('3', PROOF_TYPE_URI_FAMILYID_ED25519): {
+        'kind': 'uri', 'label': 'URI-FamilyID',
+        'locator': lambda relay, domain: '/.well-known/tor-relay/ed25519-family-id.txt',
+        'shared_proof': True,
+        'expected_desc': 'relay family_ids (43-char ed25519)',
+        'matches': lambda content, relay: bool(
+            _tokenize_proof(content, 'uri') & _norm_family_ids(relay)),
+    },
+}
+
+# What this build understands (data-driven from PROOF_SPECS).
+ALL_KNOWN_CIISSVERSIONS = tuple(sorted({v for (v, _) in PROOF_SPECS}))
+# What ships enabled by default. Ops can narrow with --ciiss-versions.
+SUPPORTED_CIISSVERSIONS_DEFAULT = ('2', '3')
+
+
+def parse_aroi_fields(contact: str) -> Dict[str, str]:
+    """Public helper: parse recognized AROI fields from a ContactInfo string.
+
+    Returns a dict of {field_name: first_value_found} for any of the
+    recognized fields (ciissversion, proof, url, email). Spec rule: keys
+    MUST appear only once; if duplicated, only the first occurrence is
+    considered.
+
+    Used by external scripts (e.g. tests/validate_known_v3_operators.py)
+    that need to group relays by their declared AROI fields without
+    importing the validator's private internals.
+    """
+    fields: Dict[str, str] = {}
+    for field, pattern in _AROI_PATTERNS.items():
+        match = pattern.search(contact)
+        if match:
+            fields[field] = match.group(1)
+    return fields
+
+
+def parse_ciissversions_flag(s: str) -> Tuple[str, ...]:
+    """Parse a comma-separated --ciiss-versions value into a validated tuple.
+
+    Raises ValueError for empty input or unknown ciissversions.
+    """
+    parts = [p.strip() for p in (s or '').split(',') if p.strip()]
+    if not parts:
+        raise ValueError("--ciiss-versions must name at least one ciissversion")
+    bad = [p for p in parts if p not in ALL_KNOWN_CIISSVERSIONS]
+    if bad:
+        raise ValueError(
+            f"unknown ciissversion(s): {','.join(bad)} "
+            f"(known: {','.join(ALL_KNOWN_CIISSVERSIONS)})"
+        )
+    return tuple(parts)
+
 
 class SecureTLSAdapter(requests.adapters.HTTPAdapter):
+    """TLS adapter with configurable security settings + SSRF-safe connect.
+
+    Uses _SSRFSafePoolManager so every TCP connection opened by this
+    adapter resolves AND connects atomically, only to globally-routable
+    IPs. This closes the DNS-rebinding window between any pre-flight
+    safety check and the actual fetch — the IP that's connected to IS
+    the IP that was vetted, in the same getaddrinfo call.
     """
-    TLS adapter with configurable security settings.
-    
-    By default uses secure settings (TLS 1.2+, certificate verification).
-    Can be configured for legacy server compatibility when explicitly needed.
-    """
-    
+
     def __init__(self, verify_certificates: bool = True, allow_legacy_tls: bool = False, **kwargs):
-        """
-        Initialize the TLS adapter.
-        
-        Args:
-            verify_certificates: Whether to verify SSL certificates (default: True)
-            allow_legacy_tls: Whether to use relaxed cipher settings (SECLEVEL=1) for 
-                compatibility with older servers (default: False). Note: TLS 1.2 is
-                always the minimum version regardless of this setting.
-        """
         self.verify_certificates = verify_certificates
         self.allow_legacy_tls = allow_legacy_tls
         super().__init__(**kwargs)
-    
-    def init_poolmanager(self, *args, **kwargs):
+
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         ctx = ssl.create_default_context()
-        
-        # Always use TLS 1.2 as minimum (TLS 1.0/1.1 are deprecated)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        
+
         if self.verify_certificates:
             ctx.check_hostname = True
             ctx.verify_mode = ssl.CERT_REQUIRED
@@ -88,204 +631,196 @@ class SecureTLSAdapter(requests.adapters.HTTPAdapter):
             logger.warning("SSL certificate verification disabled - vulnerable to MITM attacks")
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-        
+
         if self.allow_legacy_tls:
-            # SECLEVEL=1 allows older ciphers for compatibility with legacy servers
-            # TLS 1.2 remains the minimum version for security
             ctx.set_ciphers('DEFAULT@SECLEVEL=1')
-        
-        kwargs['ssl_context'] = ctx
-        return super().init_poolmanager(*args, **kwargs)
+
+        pool_kwargs['ssl_context'] = ctx
+        # Wire our SSRF-safe pool manager (subclasses urllib3's PoolManager
+        # to swap in connection classes whose _new_conn refuses non-public
+        # addresses at connect time).
+        self.poolmanager = _SSRFSafePoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
 
 
 class ParallelAROIValidator:
-    """Simplified AROI validator with parallel processing support"""
-    
+    """AROI validator with parallel processing and multi-ciissversion support."""
+
     def __init__(
-        self, 
+        self,
         max_workers: int = 20,
         verify_certificates: bool = DEFAULT_VERIFY_CERTIFICATES,
-        allow_legacy_tls: bool = DEFAULT_ALLOW_LEGACY_TLS
+        allow_legacy_tls: bool = DEFAULT_ALLOW_LEGACY_TLS,
+        supported_ciissversions: Sequence[str] = SUPPORTED_CIISSVERSIONS_DEFAULT,
     ):
-        """
-        Initialize the validator.
-        
-        Args:
-            max_workers: Maximum number of parallel workers
-            verify_certificates: Whether to verify SSL certificates (default: False for 
-                compatibility with self-signed certs on Tor relay operator domains)
-            allow_legacy_tls: Whether to allow legacy TLS settings (default: True)
-        
-        Security Note: Certificate verification is disabled by default because many Tor
-        relay operators use self-signed certificates or have misconfigured TLS. This is
-        a known trade-off for this specific use case. The validator only fetches public
-        proof files, not sensitive data.
-        """
-        # Validate and cap max_workers to prevent resource exhaustion
         if not isinstance(max_workers, int) or max_workers < 1:
             raise ValueError("max_workers must be a positive integer")
         if max_workers > _MAX_WORKERS_LIMIT:
             logger.warning(f"max_workers={max_workers} exceeds limit, capping to {_MAX_WORKERS_LIMIT}")
             max_workers = _MAX_WORKERS_LIMIT
-        
+
         self.max_workers = max_workers
         self.verify_certificates = verify_certificates
+        self._supported_ciissversions = tuple(str(v) for v in supported_ciissversions)
         self.onionoo_url = "https://onionoo.torproject.org/details"
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'AROIValidator/1.0'
-        })
-        
-        # Configure TLS adapter with explicit security settings
+        self.session.headers.update({'User-Agent': 'AROIValidator/1.0'})
+
         tls_adapter = SecureTLSAdapter(
             verify_certificates=verify_certificates,
-            allow_legacy_tls=allow_legacy_tls
+            allow_legacy_tls=allow_legacy_tls,
         )
         self.session.mount('https://', tls_adapter)
         self.session.mount('http://', tls_adapter)
-        
-        # Thread-safe domain status cache with attempt tracking
-        # Maps domain -> {'status': str, 'data': str|None, 'attempts': int, 'fingerprints': set|None}
-        #   status='pending': one thread is testing, others wait
-        #   status='retry': previous attempt failed, but attempts remain - next thread should try
-        #   status='failed': all attempts exhausted, data=error message
-        #   status='success': domain reachable, data=response text, fingerprints=parsed set
-        self._domain_cache: Dict[str, Dict] = {}
+
+        # Domain cache keyed by (domain, proof_type) tuple.
+        # Per-proof-type so a domain serving a working DNS proof and a broken
+        # URI proof (or vice versa) are tracked independently.
+        # Entry shapes:
+        #   {'status': 'pending'}                                   — being tested
+        #   {'status': 'retry', 'error_msg': str, 'attempts': int}  — failed but retries left
+        #   {'status': 'failed', 'error_msg': str,
+        #    'error_category': str, 'attempts': int}                — exhausted
+        #   {'status': 'success', 'raw': List[str]|str,
+        #    'attempts': int}                                       — verified, content cached
+        self._domain_cache: Dict[Tuple[str, str], Dict] = {}
         self._domain_cache_lock = threading.Lock()
-        self._domain_conditions: Dict[str, threading.Condition] = {}
+        self._domain_conditions: Dict[Tuple[str, str], threading.Condition] = {}
         self._domain_max_attempts = DEFAULT_DOMAIN_MAX_ATTEMPTS
-    
-    def _get_domain_status(self, domain: str) -> tuple:
-        """
-        Get domain status from cache, waiting if another thread is testing it.
-        
-        Returns:
-            (status, data) tuple:
-            - ('should_test', None): Caller should test this domain
-            - ('failed', error_msg): Domain failed all attempts, use cached error
-            - ('success', response_text): Domain succeeded, use cached response
+
+    # ------------------------------------------------------------------
+    # Domain cache (keyed by (domain, proof_type))
+    # ------------------------------------------------------------------
+
+    def _get_domain_status(self, cache_key: Tuple[str, str]) -> tuple:
+        """Get domain status from cache, waiting if another thread is testing it.
+
+        Returns (status, payload):
+            ('should_test', None): caller should test
+            ('failed', dict): exhausted; payload has error_msg + error_category
+            ('success', dict): verified; payload has raw content
         """
         with self._domain_cache_lock:
-            if domain not in self._domain_cache:
-                # First thread to test this domain - mark as pending
-                self._domain_cache[domain] = {'status': 'pending', 'data': None, 'attempts': 0}
-                self._domain_conditions[domain] = threading.Condition(self._domain_cache_lock)
+            if cache_key not in self._domain_cache:
+                self._domain_cache[cache_key] = {'status': 'pending', 'attempts': 0}
+                self._domain_conditions[cache_key] = threading.Condition(self._domain_cache_lock)
                 return ('should_test', None)
-            
-            cache_entry = self._domain_cache[domain]
-            status = cache_entry['status']
-            
+
+            entry = self._domain_cache[cache_key]
+            status = entry['status']
+
             if status == 'pending':
-                # Another thread is testing - wait for result (with timeout)
-                condition = self._domain_conditions[domain]
-                # Wait slightly longer than the network timeout to give tester a chance
+                condition = self._domain_conditions[cache_key]
                 wait_success = condition.wait(timeout=DEFAULT_TIMEOUT_SECONDS + 1.0)
-                
                 if not wait_success:
-                    # Timed out waiting for other thread - take over as tester
-                    # This prevents one stuck thread from blocking everyone
-                    logger.warning(f"Timeout waiting for domain check: {domain} - taking over")
-                    self._domain_cache[domain]['status'] = 'pending'
+                    # Timeout-takeover race: the original tester may finish
+                    # later and clobber this thread's eventual result. Low
+                    # probability (5s timeout window) and worst case is one
+                    # extra fetch, so we accept it to avoid a stuck thread
+                    # blocking everyone forever. If we ever observe this
+                    # firing in production, switch to a per-attempt-id token
+                    # to invalidate stale results.
+                    logger.warning(f"Timeout waiting for cache entry {cache_key} - taking over")
+                    self._domain_cache[cache_key]['status'] = 'pending'
                     return ('should_test', None)
-                
-                # Re-check status after waking
-                cache_entry = self._domain_cache[domain]
-                status = cache_entry['status']
-                
-                # If still pending (spurious wake or race), try testing ourselves
+                entry = self._domain_cache[cache_key]
+                status = entry['status']
                 if status == 'pending':
-                     return ('should_test', None)
-            
+                    return ('should_test', None)
+
             if status == 'retry':
-                # Previous attempt failed but we have attempts left - this thread should try
-                self._domain_cache[domain]['status'] = 'pending'
+                self._domain_cache[cache_key]['status'] = 'pending'
                 return ('should_test', None)
-            
-            # Return final status (success or failed)
-            return (status, cache_entry['data'])
-    
-    def _set_domain_result(self, domain: str, success: bool, data: Optional[str]) -> None:
-        """
-        Record result of a domain test attempt.
-        
-        Args:
-            domain: The domain that was tested
-            success: Whether the request succeeded
-            data: Response text (if success) or error message (if failure)
-        """
+
+            return (status, entry)
+
+    def _set_domain_result(
+        self,
+        cache_key: Tuple[str, str],
+        success: bool,
+        raw: Any = None,
+        error_msg: Optional[str] = None,
+        error_category: Optional[str] = None,
+    ) -> None:
+        """Record result of a domain test attempt."""
         with self._domain_cache_lock:
-            cache_entry = self._domain_cache.get(domain, {'attempts': 0})
-            cache_entry['attempts'] += 1
-            
+            entry = self._domain_cache.get(cache_key, {'attempts': 0})
+            entry['attempts'] = entry.get('attempts', 0) + 1
+
             if success:
-                cache_entry['status'] = 'success'
-                cache_entry['data'] = data
-                # Pre-parse fingerprint set for O(1) lookups (avoids re-parsing for each relay)
-                cache_entry['fingerprints'] = self._parse_fingerprint_list(data) if data else set()
-                logger.info(f"Domain cached as reachable: {domain}")
-            elif cache_entry['attempts'] >= self._domain_max_attempts:
-                # Exhausted all attempts - append cache suffix to error message
-                cache_entry['status'] = 'failed'
-                cache_entry['data'] = f"{data}. Used domain cache after {cache_entry['attempts']} attempts."
-                logger.info(f"Domain cached as unreachable after {cache_entry['attempts']} attempts: {domain}")
+                entry['status'] = 'success'
+                entry['raw'] = raw
+                # Drop stale failure fields if any
+                entry.pop('error_msg', None)
+                entry.pop('error_category', None)
+                logger.info(f"Domain proof cached as reachable: {cache_key}")
+            elif entry['attempts'] >= self._domain_max_attempts:
+                # Append cache suffix to error message (preserves existing wording)
+                final_msg = (error_msg or 'unknown error')
+                if 'Used domain cache after' not in final_msg:
+                    final_msg = f"{final_msg}. Used domain cache after {entry['attempts']} attempts."
+                entry['status'] = 'failed'
+                entry['error_msg'] = final_msg
+                entry['error_category'] = error_category or 'transport_error'
+                logger.info(f"Domain proof cached as unreachable after {entry['attempts']} attempts: {cache_key}")
             else:
-                # Still have attempts left - mark as retry so next thread tries
-                cache_entry['status'] = 'retry'
-                cache_entry['data'] = data
-                logger.debug(f"Domain attempt {cache_entry['attempts']}/{self._domain_max_attempts} failed: {domain}")
-            
-            self._domain_cache[domain] = cache_entry
-            
-            # Wake up waiting threads
-            if domain in self._domain_conditions:
-                self._domain_conditions[domain].notify_all()
-    
+                entry['status'] = 'retry'
+                entry['error_msg'] = error_msg
+                entry['error_category'] = error_category
+                logger.debug(f"Cache entry attempt {entry['attempts']}/{self._domain_max_attempts} failed: {cache_key}")
+
+            self._domain_cache[cache_key] = entry
+
+            if cache_key in self._domain_conditions:
+                self._domain_conditions[cache_key].notify_all()
+
     def clear_domain_cache(self) -> None:
-        """Clear the domain cache (call before each validation run)."""
+        """Clear domain cache and host-safety cache (call before each run)."""
         with self._domain_cache_lock:
             self._domain_cache.clear()
             self._domain_conditions.clear()
-        
+        _clear_host_safety_cache()
+
+    # ------------------------------------------------------------------
+    # Onionoo
+    # ------------------------------------------------------------------
+
     def fetch_relay_data(self, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """
-        Fetch relay data from Onionoo API and filter out stale relays.
-        
-        Filters out relays that have been offline for more than 14 days to work around
-        Onionoo API bug: https://gitlab.torproject.org/tpo/network-health/metrics/onionoo/-/issues/40052
+        """Fetch relay data from Onionoo and filter out stale relays.
+
+        Includes `family_ids` (new for ciissversion:3) — Onionoo returns this
+        only for relays whose Tor daemon has a happy-family key.
         """
         try:
             response = self.session.get(
                 self.onionoo_url,
-                params={'type': 'relay', 'fields': 'nickname,fingerprint,contact,running,last_seen'},
-                timeout=30
+                params={
+                    'type': 'relay',
+                    'fields': 'nickname,fingerprint,contact,running,last_seen,family_ids',
+                },
+                timeout=30,
             )
             response.raise_for_status()
             data = response.json()
             relays = data.get('relays', [])
-            
-            # Filter out relays offline for more than 14 days
             filtered_relays = self._filter_active_relays(relays)
-            
             return filtered_relays[:limit] if limit else filtered_relays
         except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
             logger.error(f"Error fetching relay data: {e}")
             return []
-    
+
     def _filter_active_relays(self, relays: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Filter out relays that have been offline for more than 14 days.
-        
-        Workaround for Onionoo API bug where relays offline for over a year are returned
-        despite documentation stating only relays from the past week are included.
-        """
         cutoff_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=14)
         return [
             relay for relay in relays
             if relay.get('running', False) or self._is_recently_seen(relay, cutoff_date)
         ]
-    
+
     def _is_recently_seen(self, relay: Dict[str, Any], cutoff_date: datetime) -> bool:
-        """Check if a non-running relay was seen within the cutoff period."""
         last_seen_str = relay.get('last_seen')
         if not last_seen_str:
             return False
@@ -294,269 +829,637 @@ class ParallelAROIValidator:
             return last_seen >= cutoff_date
         except ValueError:
             return False
-    
-    def validate_relay(self, relay: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate a single relay's AROI proof"""
-        result = {
+
+    # ------------------------------------------------------------------
+    # Validation entry point — single dispatcher
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_result_skeleton(relay: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a result dict with the canonical seven base keys.
+
+        Used by both the normal validate_relay path and validate_parallel's
+        exception handler so downstream consumers always see the same shape.
+        """
+        return {
             'nickname': relay.get('nickname', 'Unknown'),
             'fingerprint': relay.get('fingerprint', ''),
             'valid': False,
             'proof_type': None,
             'domain': None,
             'validation_steps': [],
-            'error': None
+            'error': None,
         }
-        
+
+    def validate_relay(self, relay: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate a single relay's AROI proof. Dispatches by ciissversion + proof type."""
+        result = self._make_result_skeleton(relay)
+
         contact = relay.get('contact', '')
         if not contact:
             result['error'] = "No contact information"
             return result
-        
-        # Parse AROI fields
-        aroi_fields, missing_fields = self._parse_aroi_fields(contact)
-        if not aroi_fields:
-            result['error'] = f"Missing AROI fields: {', '.join(missing_fields)}"
+
+        aroi, _ = self._parse_aroi_fields(contact)
+
+        # Row 1: missing ciissversion (required for any AROI claim)
+        if 'ciissversion' not in aroi:
+            missing = ['ciissversion']
+            if 'proof' not in aroi:
+                missing.append('proof')
+            result['error'] = f"Missing AROI fields: {', '.join(missing)}"
             return result
-        
-        # Check ciissversion
-        if aroi_fields.get('ciissversion') != '2':
-            result['error'] = f"Unsupported ciissversion: {aroi_fields.get('ciissversion')}"
+
+        version = aroi['ciissversion']
+        result['ciissversion'] = version  # used by stats + insights
+
+        # Row 2: ciissversion not enabled by --ciiss-versions
+        if version not in self._supported_ciissversions:
+            result['error'] = (
+                f"Unsupported ciissversion: {version} "
+                f"(supported: {','.join(self._supported_ciissversions)})"
+            )
+            result['error_category'] = 'ciissversion_unsupported'
             return result
-        
-        # Validate based on proof type
-        proof_type = aroi_fields.get('proof')
-        if proof_type == PROOF_TYPE_DNS_RSA:
-            result = self._validate_dns_rsa(relay, aroi_fields, result)
-        elif proof_type == PROOF_TYPE_URI_RSA:
-            result = self._validate_uri_rsa(relay, aroi_fields, result)
-        else:
+
+        has_url = bool(aroi.get('url'))
+        proof_type = aroi.get('proof')
+
+        # ciissversion-specific required-fields rules (matches §4 decision table)
+        if version == '2':
+            # Row 4: v2 with no proof
+            if not proof_type:
+                result['error'] = "Missing AROI fields: proof"
+                return result
+        elif version == '3':
+            # Row 6: v3 with no url is spec-compliant, NOT an error.
+            # CIISS v3 spec: `proof` is ignored when `url` is not set. An
+            # operator may declare ciissversion:3 with informational fields
+            # only (email, pgp, ...) and no domain claim. There's nothing to
+            # verify; v3 has no "default proof type". Same shape as v2 no-AROI.
+            if not has_url:
+                return result
+            # Row 7: v3 with url but no proof
+            if not proof_type:
+                result['error'] = "Missing AROI field: proof, required when url is set"
+                result['error_category'] = 'missing_proof_field'
+                _finalize_hint(result)
+                return result
+
+        # Spec lookup (rows 5, 8, 9)
+        spec = PROOF_SPECS.get((version, proof_type))
+        if spec is None:
             result['error'] = f"Unsupported proof type: {proof_type}"
-        
-        return result
-    
-    def _parse_aroi_fields(self, contact: str) -> tuple:
-        """
-        Parse AROI fields from contact information.
-        
-        Returns:
-            Tuple of (fields_dict or None, list of missing required field names)
-        """
-        fields = {}
-        required_fields = ['ciissversion', 'proof']
-        
-        # Use pre-compiled patterns for efficiency
-        for field, pattern in _AROI_PATTERNS.items():
-            match = pattern.search(contact)
-            if match:
-                fields[field] = match.group(1)
-        
-        missing = [f for f in required_fields if f not in fields]
-        
-        if 'ciissversion' in fields and 'proof' in fields:
-            return fields, missing
-        return None, missing
-    
-    def _validate_dns_rsa(self, relay: Dict, aroi_fields: Dict, result: Dict) -> Dict:
-        """Validate DNS-RSA proof"""
-        url = aroi_fields.get('url')
-        if not url:
-            result['error'] = "Missing AROI field: url, required for DNS-RSA proof"
+            # Row 8: v3 declaring a v2 proof type — pin specific guidance
+            if version == '3' and proof_type in (PROOF_TYPE_DNS_RSA, PROOF_TYPE_URI_RSA):
+                result['error_category'] = 'wrong_proof_type_rsa'
+                _finalize_hint(result)
             return result
-        
-        # Extract domain
+
+        # Rows 10–18: dispatch to per-kind validator
+        out = self._validate_kind(relay, aroi, result, spec)
+        if version == '3':
+            _finalize_hint(out)
+        return out
+
+    def _parse_aroi_fields(self, contact: str) -> Tuple[Dict[str, str], List[str]]:
+        """Pure parser: extract recognized AROI fields from contact string.
+
+        Returns (fields_dict, missing_list). `missing_list` is informational
+        (kept for any callers that read it); validate_relay does its own
+        ciissversion-aware required-field checks.
+        """
+        fields = parse_aroi_fields(contact)
+        missing = [f for f in ('ciissversion', 'proof') if f not in fields]
+        return fields, missing
+
+    # ------------------------------------------------------------------
+    # Per-kind validator (DNS or URI), spec-driven
+    # ------------------------------------------------------------------
+
+    def _validate_kind(
+        self,
+        relay: Dict[str, Any],
+        aroi: Dict[str, str],
+        result: Dict[str, Any],
+        spec: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Generic per-kind validator. Branches on spec['kind'] for transport;
+        all version-specific behavior is in spec callbacks."""
+        label = spec['label']
+        # Set proof_type early so invalid-domain rows still bucket correctly.
+        result['proof_type'] = aroi['proof']
+
+        url = aroi.get('url')
+        # Distinguish "url missing entirely" from "url present but unparseable":
+        # missing-url uses the legacy v2 wording ("Missing AROI field: url, ...")
+        # which downstream consumers and the README error catalogue depend on.
+        if not url:
+            result['error'] = f"Missing AROI field: url, required for {label} proof"
+            return result
         domain = self._extract_domain(url)
         if not domain:
-            result['error'] = f"DNS-RSA: Invalid domain in url field: {url}"
+            result['error'] = f"{label}: Invalid domain in url field: {url}"
+            result['error_category'] = 'invalid_url'
             return result
-        
-        result['proof_type'] = PROOF_TYPE_DNS_RSA
+
+        version = aroi['ciissversion']
+        # ciissversion:3+ requires family_ids from Onionoo. Derived rule (one
+        # condition for all future non-v2 versions until a future spec proves
+        # otherwise). Empty list and missing key both fall here via `or []`.
+        if version != '2' and not relay.get('family_ids'):
+            result['error'] = (
+                f"{label}: Relay has no family_ids in Onionoo, "
+                f"cannot verify ciissversion:{version} proof"
+            )
+            result['error_category'] = 'missing_family_ids'
+            return result
+
         result['domain'] = domain
-        
-        # Check domain cache status
-        status, data = self._get_domain_status(domain)
-        
+
+        cache_key = (domain, aroi['proof'])
+        status, entry = self._get_domain_status(cache_key)
         if status == 'failed':
-            result['error'] = data  # Error already has cache suffix from _set_domain_result
+            result['error'] = entry.get('error_msg') or 'cached failure'
+            result['error_category'] = entry.get('error_category') or 'transport_error'
             return result
-        # Note: DNS-RSA doesn't benefit from 'success' caching since each relay
-        # has a unique subdomain query. We still check for 'failed' to skip dead domains.
-        
-        # Construct DNS query domain
-        fingerprint = relay['fingerprint'].lower()
-        query_domain = f"{fingerprint}.{domain}"
-        
-        # Query DNS TXT record
+        if status == 'success' and spec['shared_proof']:
+            return self._finalize_match(
+                result, spec, entry['raw'], relay, domain, cached=True
+            )
+
+        # Cache miss — actually fetch.
+        if spec['kind'] == 'dns':
+            return self._validate_dns_fetch(relay, aroi, result, spec, domain, cache_key)
+        return self._validate_uri_fetch(relay, aroi, result, spec, url, domain, cache_key)
+
+    def _validate_dns_fetch(self, relay, aroi, result, spec, domain, cache_key) -> Dict:
+        """Fetch DNS TXT records and dispatch to _finalize_match."""
+        label = spec['label']
+        query_name = spec['locator'](relay, domain)
         try:
-            answers = dns.resolver.resolve(query_domain, 'TXT')
-            txt_records = [str(rdata).strip('"') for rdata in answers]
-            
-            # DNS worked - mark domain as reachable (cache empty response, just marks as success)
-            self._set_domain_result(domain, success=True, data="")
-            
-            # Validate proof
-            if self._validate_proof_content(txt_records, relay['fingerprint']):
-                result['valid'] = True
-                result['validation_steps'].append({
-                    'step': 'DNS TXT lookup',
-                    'success': True,
-                    'details': f"Found valid proof at {query_domain}"
-                })
-            else:
-                # Show actual content found
-                found_content = '; '.join(txt_records)[:100] if txt_records else 'empty'
-                result['error'] = f"DNS-RSA: TXT record has invalid proof content. Expected 'we-run-this-tor-relay', found: {found_content}"
-        except (dns.resolver.Timeout, dns.resolver.NoNameservers) as e:
-            # Record DNS timeout/unreachable (counts toward domain's attempt limit)
-            error_msg = f"DNS-RSA: Lookup failed: {str(e)}"
-            self._set_domain_result(domain, success=False, data=error_msg)
-            result['error'] = error_msg
+            answers = dns.resolver.resolve(query_name, 'TXT')
+            # Multi-string TXT records: rdata.strings is tuple[bytes]; concatenate
+            # before stripping. Matters for long v3 family_id rollover content.
+            raw_records = [
+                ''.join(
+                    s.decode() if isinstance(s, bytes) else s
+                    for s in rdata.strings
+                ).strip()
+                for rdata in answers
+            ]
+            self._set_domain_result(cache_key, success=True, raw=raw_records)
+            return self._finalize_match(result, spec, raw_records, relay, domain, cached=False)
         except dns.resolver.NXDOMAIN:
-            # NXDOMAIN is expected for relays not in the list - don't count against domain
-            result['error'] = f"DNS-RSA: TXT record not found at {domain}"
+            # NXDOMAIN: TXT name doesn't exist. For v2 dns-rsa this is just
+            # "this relay isn't in the list" (per-relay subdomain). For v3
+            # dns-familyid, this means the operator never published the
+            # shared TXT — actionable error with hint.
+            result['error'] = f"{label}: TXT record not found at {domain}"
+            result['error_category'] = 'dns_txt_missing'
+            return result
+        except dns.resolver.NoAnswer:
+            # NoAnswer: domain exists but has no TXT records at this name.
+            # Distinct from NXDOMAIN (the name itself is unresolvable).
+            # Wording matches README error reference.
+            result['error'] = f"{label}: Lookup failed, no TXT record answer for {domain}"
+            result['error_category'] = 'dns_txt_missing'
+            return result
+        except (dns.resolver.Timeout, dns.resolver.NoNameservers) as e:
+            msg = f"{label}: Lookup failed: {e}"
+            self._set_domain_result(
+                cache_key, success=False,
+                error_msg=msg, error_category='transport_error',
+            )
+            result['error'] = msg
+            result['error_category'] = 'transport_error'
+            return result
         except Exception as e:
-            result['error'] = f"DNS-RSA: Lookup failed: {str(e)}"
-        
-        return result
-    
-    def _validate_uri_rsa(self, relay: Dict, aroi_fields: Dict, result: Dict) -> Dict:
-        """Validate URI-RSA proof according to ContactInfo spec"""
-        url = aroi_fields.get('url')
-        if not url:
-            result['error'] = "Missing AROI field: url, required for URI-RSA proof"
+            result['error'] = f"{label}: Lookup failed: {e}"
+            result['error_category'] = 'transport_error'
             return result
-        
-        # Normalize URL (ensure it has a scheme)
-        url = self._normalize_url(url)
-        
-        # Extract base URL (scheme + domain only, no path)
-        parsed = urlparse(url)
-        base_url = f"{parsed.scheme}://{parsed.netloc}"
-        domain = parsed.netloc
-        
-        # Validate domain before proceeding
-        if not domain or '.' not in domain:
-            result['error'] = f"URI-RSA: Invalid domain in url field: {aroi_fields.get('url')}"
+
+    # Categories we'd rather surface than transport_error when both
+    # primary and www-fallback fail with mixed reasons. More-actionable
+    # categories (operator can do something specific) win over generic
+    # transport errors.
+    # Categories surfaced as the result error_category when both primary
+    # and www-fallback fail with mixed reasons. More-actionable categories
+    # (operator can do something specific) win over generic transport
+    # errors. uri_file_missing first (operator can publish the file);
+    # redirect_disallowed second (operator can remove the redirect).
+    _URI_PREFERRED_CATEGORIES = ('uri_file_missing', 'redirect_disallowed')
+
+    def _validate_uri_fetch(self, relay, aroi, result, spec, url, domain, cache_key) -> Dict:
+        """Fetch URI proof via HTTPS (with www-fallback) and dispatch to _finalize_match.
+
+        SSRF protection: every target host (primary and www-fallback) is
+        passed through is_safe_public_host BEFORE any HTTPS connection,
+        rejecting IP literals and hostnames resolving to
+        private/loopback/link-local addresses.
+        """
+        label = spec['label']
+        path = spec['locator'](relay, domain)
+
+        # SSRF gate on primary host BEFORE any network connect.
+        safe, reason = is_safe_public_host(domain)
+        if not safe:
+            msg = f"{label}: {reason} (SSRF-blocked: {domain})"
+            self._set_domain_result(
+                cache_key, success=False,
+                error_msg=msg, error_category='unsafe_target',
+            )
+            result['error'] = msg
+            result['error_category'] = 'unsafe_target'
             return result
-        
-        result['proof_type'] = PROOF_TYPE_URI_RSA
-        result['domain'] = domain
-        
-        fingerprint = relay['fingerprint'].upper()
-        
-        # Check domain cache - this will wait if another thread is testing
-        status, data = self._get_domain_status(domain)
-        
-        if status == 'failed':
-            result['error'] = data  # Error already has cache suffix from _set_domain_result
-            return result
-        elif status == 'success':
-            # Domain succeeded before - use cached fingerprint set for O(1) lookup
-            with self._domain_cache_lock:
-                cached_fingerprints = self._domain_cache[domain].get('fingerprints', set())
-            
-            if fingerprint in cached_fingerprints:
-                result['valid'] = True
-                result['validation_steps'].append({
-                    'step': 'URI proof fetch (cached)',
-                    'success': True,
-                    'details': f"Found fingerprint in cached response for {domain}"
-                })
-                return result
-            else:
-                result['error'] = f"URI-RSA: Fingerprint not found at {domain}"
-                return result
-        
-        # status == 'should_test': We should test this domain
-        # Try the primary URL first
-        primary_url = f"{base_url}/.well-known/tor-relay/rsa-fingerprint.txt"
-        response, error, attempts = self._fetch_with_retry(primary_url)
-        
-        if response:
-            # Success! Cache the response for other relays using this domain
-            self._set_domain_result(domain, success=True, data=response.text)
-            
-            # Optimization: Use the cached fingerprint set we just created
-            with self._domain_cache_lock:
-                cached_fingerprints = self._domain_cache[domain].get('fingerprints', set())
-            
-            if fingerprint in cached_fingerprints:
-                result['valid'] = True
-                result['validation_steps'].append({
-                    'step': 'URI proof fetch',
-                    'success': True,
-                    'details': f"Found fingerprint in {primary_url}"
-                })
-                return result
-            else:
-                result['error'] = f"URI-RSA: Fingerprint not found at {domain}"
-                return result
-        
-        all_errors = [error]
-        
-        # Only try www variant if primary failed with HTTP error (not timeout/connection error)
-        # If the domain itself is unreachable, www variant won't help
-        is_connectivity_error = any(p in error.lower() for p in _CONNECTIVITY_ERROR_PATTERNS)
-        
-        if not is_connectivity_error and not parsed.netloc.startswith('www.'):
-            www_url = f"{parsed.scheme}://www.{parsed.netloc}/.well-known/tor-relay/rsa-fingerprint.txt"
-            response, error, attempts = self._fetch_with_retry(www_url)
-            
-            if response:
-                self._set_domain_result(domain, success=True, data=response.text)
-                
-                # Optimization: Use the cached fingerprint set we just created
-                with self._domain_cache_lock:
-                    cached_fingerprints = self._domain_cache[domain].get('fingerprints', set())
-                
-                if fingerprint in cached_fingerprints:
-                    result['valid'] = True
+
+        # Force HTTPS for .well-known fetches regardless of operator's url:
+        # scheme. CIISS spec requires HTTPS. Use parsed.hostname (port-stripped,
+        # lowercase) to avoid `:8443` appearing in the fetch URL.
+        attempts: List[Tuple[str, str, bool]] = [
+            (f"https://{domain}{path}", domain, False),
+        ]
+
+        all_errors: List[str] = []
+        all_categories: List[Optional[str]] = []
+
+        for fetch_url, fetch_host, _is_www in attempts:
+            response, error_msg, error_category, _ = self._fetch_with_retry(
+                fetch_url, error_label=label
+            )
+            if response is not None:
+                self._set_domain_result(cache_key, success=True, raw=response.text)
+                # If we recovered via the www-fallback after primary errored
+                # (e.g. operator redirects bare-domain → www but serves the
+                # proof only on www), record the ignored primary error in
+                # validation_steps for diagnostic visibility. The relay still
+                # validates; this is not a failure.
+                if _is_www and all_errors:
+                    primary_cat = all_categories[0] if all_categories else 'unknown'
                     result['validation_steps'].append({
-                        'step': 'URI proof fetch',
-                        'success': True,
-                        'details': f"Found fingerprint in {www_url}"
+                        'step': f"{label} primary fetch failed (ignored)",
+                        'success': False,
+                        'details': (
+                            f"primary URL returned {primary_cat}; "
+                            f"validated via www-fallback. Primary error: "
+                            f"{all_errors[0][:200]}"
+                        ),
                     })
-                    return result
-                else:
-                    result['error'] = f"URI-RSA: Fingerprint not found at {domain}"
-                    return result
-            else:
-                all_errors.append(error)
-        
-        # All URL variations failed - record this attempt (may allow more attempts)
-        error_msg = "; ".join(all_errors) if all_errors else "Failed to fetch URI proof"
-        self._set_domain_result(domain, success=False, data=all_errors[0] if all_errors else error_msg)
-        result['error'] = error_msg
+                return self._finalize_match(
+                    result, spec, response.text, relay, domain, cached=False
+                )
+            all_errors.append(error_msg)
+            all_categories.append(error_category)
+
+            # After the primary, decide whether to try www-fallback.
+            #
+            # Skip the fallback only when:
+            #  - primary failed with a connectivity error (the host is
+            #    unreachable; www variant won't help if the parent is down)
+            #  - the SSRF gate rejects the www host (e.g. naked-host A
+            #    record is public but www variant resolves into private
+            #    space).
+            #
+            # We DO try the fallback for HTTP redirects (3xx). One bad
+            # primary doesn't mean the operator's setup is broken: many
+            # operators redirect bare-domain → www and serve the proof
+            # only on www. If the www-fallback fetch succeeds, the relay
+            # validates (with a note recording that the primary redirected,
+            # which we ignored). If both primary and www-fallback fail,
+            # the relay fails normally.
+            if not _is_www and len(attempts) == 1:
+                is_connectivity = any(
+                    p in error_msg.lower() for p in _CONNECTIVITY_ERROR_PATTERNS
+                )
+                if not is_connectivity and not domain.startswith('www.'):
+                    www_host = f"www.{domain}"
+                    safe_www, _reason = is_safe_public_host(www_host)
+                    if safe_www:
+                        attempts.append((f"https://{www_host}{path}", www_host, True))
+
+        # All variants failed. Pick the most-actionable category across all
+        # attempts (e.g. uri_file_missing on either primary or www trumps a
+        # generic transport_error from the other). Pin both the chosen
+        # category AND the message that produced it together, so the
+        # cache entry surfaces a coherent (message, category) pair to
+        # subsequent relays — not the first attempt's message paired with
+        # a later attempt's category.
+        chosen_idx = next(
+            (i for i, c in enumerate(all_categories)
+             if c in self._URI_PREFERRED_CATEGORIES),
+            0 if all_categories else -1,
+        )
+        chosen_category = (
+            all_categories[chosen_idx] if chosen_idx >= 0 else None
+        ) or 'transport_error'
+        chosen_msg = (
+            all_errors[chosen_idx] if chosen_idx >= 0 else None
+        ) or "Failed to fetch URI proof"
+
+        combined_msg = "; ".join(e for e in all_errors if e) or chosen_msg
+        self._set_domain_result(
+            cache_key, success=False,
+            error_msg=chosen_msg,           # aligned with chosen_category
+            error_category=chosen_category,
+        )
+        result['error'] = combined_msg
+        result['error_category'] = chosen_category
         return result
-    
-    def _parse_fingerprint_list(self, text: str) -> set:
-        """Parse fingerprint list from response text into a set for O(1) lookups."""
-        return {
-            line.strip().upper()
-            for line in text.split('\n')
-            if line.strip() and not line.strip().startswith('#')
-        }
-    
+
+    # ------------------------------------------------------------------
+    # _finalize_match: secret-key sniff + match + content-mismatch error
+    # ------------------------------------------------------------------
+
+    def _finalize_match(
+        self,
+        result: Dict[str, Any],
+        spec: Dict[str, Any],
+        content: Any,
+        relay: Dict[str, Any],
+        domain: str,
+        cached: bool,
+    ) -> Dict[str, Any]:
+        """Run secret-key sniff, then spec['matches']; on miss produce a
+        kind- and version-appropriate not-found error with category tag."""
+        label = spec['label']
+        # Contract: validate_relay always sets ciissversion before we reach here.
+        version = result['ciissversion']
+        kind = spec['kind']
+
+        # Secret-key sniff (security-protective; runs only for v3 — v2 RSA
+        # proofs cannot credibly leak a family secret_family_key, and we
+        # avoid touching v2 error/result shapes).
+        if version == '3':
+            content_lines = (
+                content if isinstance(content, list)
+                else content.splitlines() if isinstance(content, str)
+                else []
+            )
+            if _looks_like_secret_key(content_lines):
+                result['error'] = (
+                    f"SECURITY: {label}: published content appears to "
+                    f"contain .secret_family_key. Rotate immediately."
+                )
+                result['error_category'] = 'secret_key_leaked'
+                return result
+
+        if spec['matches'](content, relay):
+            result['valid'] = True
+            step = 'cached' if cached else 'fetched'
+            result['validation_steps'].append({
+                'step': f"{label} proof matched ({step})",
+                'success': True,
+                'details': f"Content matched for {domain}",
+            })
+            return result
+
+        # Mismatch path. Build all the parsed-content artifacts we need ONCE.
+        # v2 dns-rsa uses substring (no tokens); for others, _tokenize_proof
+        # gives the comparable set used for both error formatting and the
+        # case-mismatch diagnostic.
+        if kind == 'dns':
+            found_summary = '; '.join(content)[:100] if content else 'empty'
+        else:
+            # URI: content is response.text; show first 100 chars.
+            found_summary = (content or '').strip()[:100] or 'empty'
+
+        if kind == 'dns' and version == '2':
+            # v2 dns-rsa: legacy substring-mismatch wording, no tokens needed.
+            result['error'] = (
+                f"{label}: TXT record has invalid proof content. "
+                f"Expected {spec['expected_desc']}, found: {found_summary}"
+            )
+            result['error_category'] = 'dns_content_mismatch'
+            return result
+
+        if kind == 'uri' and version == '2':
+            # Preserve existing v2 URI-RSA wording byte-for-byte.
+            result['error'] = f"{label}: Fingerprint not found at {domain}"
+            result['error_category'] = 'uri_content_mismatch'
+            return result
+
+        # v3 mismatch (DNS or URI). Compute family_ids and tokens once; reuse
+        # for both the error message and the case-mismatch diagnostic.
+        relay_fids = _norm_family_ids(relay)
+        tokens = _tokenize_proof(content, kind)
+        case_mismatch = (
+            bool(relay_fids)
+            and not (tokens & relay_fids)
+            and bool({t.lower() for t in tokens} & {f.lower() for f in relay_fids})
+        )
+        suffix = " (case mismatch detected — spec requires case-sensitive match)" if case_mismatch else ""
+
+        if kind == 'dns':
+            expected_ids = ', '.join(sorted(relay_fids)) or '(none)'
+            result['error'] = (
+                f"{label}: TXT record content does not match relay family_ids. "
+                f"Expected one of: {expected_ids}, found: {found_summary}{suffix}"
+            )
+            result['error_category'] = 'dns_content_mismatch'
+        else:
+            result['error'] = f"{label}: family_id not found at {domain}{suffix}"
+            result['error_category'] = 'uri_content_mismatch'
+        return result
+
+    # ------------------------------------------------------------------
+    # URL parsing helpers
+    # ------------------------------------------------------------------
+
     def _normalize_url(self, url: str) -> str:
-        """
-        Ensure URL has a scheme, defaulting to https.
-        
-        Args:
-            url: The URL to normalize
-            
-        Returns:
-            URL with scheme prefix
-        """
+        """Ensure URL has a scheme (default https)."""
         if not url.startswith(('http://', 'https://')):
             return 'https://' + url
         return url
-    
+
+    def _extract_domain(self, url: str) -> Optional[str]:
+        """Extract hostname (port-stripped, lowercase) from a url-ish string."""
+        if not url or not isinstance(url, str):
+            return None
+        url = self._normalize_url(url)
+        try:
+            parsed = urlparse(url)
+            # parsed.hostname strips port and lowercases.
+            domain = parsed.hostname
+            if not domain:
+                # Fallback: take first path segment if netloc was empty
+                domain = parsed.path.split('/')[0].split(':')[0].lower() if parsed.path else None
+            if domain and '.' in domain:
+                return domain
+            return None
+        except (ValueError, AttributeError) as e:
+            logger.debug(f"Failed to extract domain from {url}: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # HTTP retry + SSL error categorization (parameterized by error_label)
+    # ------------------------------------------------------------------
+
+    def _fetch_with_retry(
+        self,
+        url: str,
+        error_label: str,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+    ) -> Tuple[Optional[requests.Response], str, Optional[str], int]:
+        """Fetch URL with retry logic. Returns (response, error_msg, error_category, attempts).
+
+        error_label is required (e.g. 'URI-RSA' for v2, 'URI-FamilyID' for v3).
+        v3 HTTP 404 is rendered as 'proof file not found' with category
+        'uri_file_missing' — different from generic '404 for' wording.
+        """
+        max_attempts = max_retries + 1
+        last_error = ""
+        last_category: Optional[str] = None
+        attempt = 1
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                # SSRF defense: disable redirects entirely. CIISS spec also
+                # mandates the proof URI MUST NOT redirect to another domain;
+                # this enforces that. A 3xx response is treated as a proof
+                # failure (see status==3xx branch below).
+                response = self.session.get(
+                    url,
+                    timeout=DEFAULT_TIMEOUT_SECONDS,
+                    verify=self.verify_certificates,
+                    allow_redirects=False,
+                )
+                if 300 <= response.status_code < 400:
+                    # CIISS spec: proof URI MUST NOT redirect to another
+                    # domain. Disabling redirects also acts as SSRF defense
+                    # (a 3xx to a private/loopback IP would otherwise be
+                    # silently followed by `requests`).
+                    domain = urlparse(url).hostname or ''
+                    location = response.headers.get('Location', '<no Location header>')
+                    last_error = (
+                        f"{error_label}: HTTP redirect ({response.status_code}) "
+                        f"to {location} for {domain} at URL: {url} — CIISS spec "
+                        f"disallows redirects on proof URI"
+                    )
+                    last_category = 'redirect_disallowed'
+                    break
+                response.raise_for_status()
+                return response, "", None, attempt
+
+            except requests.exceptions.Timeout:
+                last_error = f"{error_label}: HTTP error connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url}"
+                last_category = 'transport_error'
+                if attempt < max_attempts:
+                    continue
+
+            except requests.exceptions.ConnectionError as e:
+                error_str = str(e).lower()
+                last_category = 'transport_error'
+                if 'refused' in error_str:
+                    last_error = f"{error_label}: HTTP error connection refused for URL: {url}"
+                    if attempt < max_attempts:
+                        continue
+                elif 'reset' in error_str:
+                    last_error = f"{error_label}: HTTP error connection reset for URL: {url}"
+                    if attempt < max_attempts:
+                        continue
+                elif 'remotedisconnected' in error_str or 'remote end closed' in error_str:
+                    last_error = f"{error_label}: HTTP error connection remote end closed connection for URL: {url}"
+                    break
+                elif 'max retries' in error_str or 'nameresolution' in error_str:
+                    domain = urlparse(url).hostname or ''
+                    if 'nameresolution' in error_str:
+                        last_error = f"{error_label}: HTTP error name resolution failed for {domain} at URL: {url}"
+                    else:
+                        last_error = f"{error_label}: HTTP error connection max retries exceeded for URL: {url}"
+                    break
+                else:
+                    last_error = f"{error_label}: HTTP error connection max retries exceeded for URL: {url}"
+                    break
+
+            except requests.exceptions.SSLError as e:
+                last_error = self._categorize_ssl_error(str(e), url, error_label, attempt, max_attempts)
+                last_category = 'transport_error'
+                break
+
+            except requests.exceptions.HTTPError as e:
+                domain = urlparse(url).hostname or ''
+                status = e.response.status_code if e.response is not None else 0
+                # v3 special case: 404 on the well-known proof file is the
+                # most actionable failure (operator never published the file).
+                if status == 404 and error_label == 'URI-FamilyID':
+                    last_error = f"{error_label}: proof file not found at {domain} at URL: {url}"
+                    last_category = 'uri_file_missing'
+                else:
+                    last_error = f"{error_label}: HTTP error {status} for {domain} at URL: {url}"
+                    last_category = 'transport_error'
+                break
+
+            except Exception as e:
+                last_error = f"{error_label}: HTTP error {str(e)[:100]} for URL: {url}"
+                last_category = 'transport_error'
+                break
+
+        return None, last_error, last_category, attempt
+
+    def _categorize_ssl_error(
+        self,
+        error_str: str,
+        url: str,
+        error_label: str,
+        attempt: int = 1,
+        max_attempts: int = 2,
+    ) -> str:
+        """Categorize SSL errors and return detailed, actionable error messages."""
+        parsed = urlparse(url)
+        hostname = parsed.hostname or ''
+        error_lower = error_str.lower()
+
+        cert_info_cache: Dict[str, Any] = {}
+
+        def get_cert_info():
+            if 'data' not in cert_info_cache:
+                cert_info_cache['data'] = self._get_ssl_cert_info(hostname)
+            return cert_info_cache['data']
+
+        # (patterns, message_func) table
+        error_patterns = [
+            (['timed out', 'timeout'],
+             lambda: f"{error_label}: HTTP error connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url}"),
+            (['connection refused'],
+             lambda: f"{error_label}: HTTP error connection refused for URL: {url}"),
+            (['connection reset'],
+             lambda: f"{error_label}: HTTP error connection reset for URL: {url}"),
+            (['certificate verify failed'],
+             lambda: f"{error_label}: HTTP SSL certificate verification failed for {hostname} at URL: {url}"),
+            (['certificate has expired', 'cert_has_expired'],
+             lambda: f"{error_label}: HTTP SSL certificate expired on {get_cert_info().get('expiration', 'unknown date')} for {hostname} at URL: {url}"),
+            (['self signed certificate in certificate chain'],
+             lambda: f"{error_label}: HTTP SSL certificate chain contains self-signed cert (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
+            (['self signed certificate', 'self_signed_cert'],
+             lambda: f"{error_label}: HTTP SSL certificate is self-signed (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
+            (['unable to get local issuer'],
+             lambda: f"{error_label}: HTTP SSL certificate chain incomplete for {hostname} at URL: {url}"),
+            (['unknown ca', 'unable to get issuer'],
+             lambda: f"{error_label}: HTTP SSL unknown CA \"{get_cert_info().get('issuer_name', 'unknown')}\" for {hostname} at URL: {url}"),
+            (['sslv3_alert_handshake_failure', 'sslv3 alert handshake'],
+             lambda: f"{error_label}: HTTP SSL handshake failure due to SSLv3 handshake for {hostname} at URL: {url}"),
+            (['handshake failure', 'handshake_failure'],
+             lambda: f"{error_label}: HTTP SSL handshake failure due to older version {get_cert_info().get('tls_version', 'unknown')} for {hostname} at URL: {url}"),
+            (['unexpected_eof', 'unexpected eof'],
+             lambda: f"{error_label}: HTTP SSL error unexpected EOF for {hostname} at URL: {url}"),
+        ]
+
+        if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
+            cert_hosts = get_cert_info().get('hostnames', ['unknown'])
+            cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
+            return f"{error_label}: HTTP SSL hostname mismatch for remote {cert_hosts_str} but expected {hostname} at URL: {url}"
+
+        for patterns, message_func in error_patterns:
+            if any(p in error_lower for p in patterns):
+                return message_func()
+
+        return f"{error_label}: HTTP SSL error {error_str[:100]} for {hostname} at URL: {url}"
+
     @staticmethod
     def _parse_cert_field(field_data: list) -> Dict[str, str]:
-        """Parse certificate field (issuer/subject) into a flat dict. DRY helper."""
-        result = {}
+        result: Dict[str, str] = {}
         for item in field_data:
             if isinstance(item, tuple):
-                # Handle both ((key, val),) and (key, val) formats
                 if len(item) == 2 and isinstance(item[0], str):
                     result[item[0]] = item[1]
                 else:
@@ -564,309 +1467,115 @@ class ParallelAROIValidator:
                         if isinstance(subitem, tuple) and len(subitem) == 2:
                             result[subitem[0]] = subitem[1]
         return result
-    
+
     def _get_ssl_cert_info(self, hostname: str, port: int = 443) -> Dict[str, Any]:
-        """
-        Fetch SSL certificate details for detailed error messages.
-        
-        Returns dict with: expiration, issuer_name, hostnames, tls_version, etc.
-        """
         try:
             context = ssl.create_default_context()
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
-            
+
             with socket.create_connection((hostname, port), timeout=5) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                     cert = ssock.getpeercert(binary_form=False)
                     tls_version = ssock.version()
-                    
+
                     if not cert:
                         return {'tls_version': tls_version}
-                    
-                    # Parse expiration date
+
                     not_after = cert.get('notAfter', '')
                     try:
                         exp_str = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z').strftime('%Y-%m-%d')
                     except (ValueError, TypeError):
                         exp_str = not_after
-                    
-                    # Parse issuer and subject using shared helper
+
                     issuer = self._parse_cert_field(cert.get('issuer', []))
                     subject = self._parse_cert_field(cert.get('subject', []))
-                    
+
                     issuer_cn = issuer.get('commonName', '')
                     issuer_org = issuer.get('organizationName', '')
                     cn = subject.get('commonName', '')
                     san = [x[1] for x in cert.get('subjectAltName', []) if x[0] == 'DNS']
-                    
+
                     return {
                         'expiration': exp_str,
                         'issuer_name': issuer_cn or issuer_org or 'Unknown',
                         'common_name': cn,
                         'subject_alt_names': san,
                         'hostnames': list(set([cn] + san)) if cn else san,
-                        'tls_version': tls_version
+                        'tls_version': tls_version,
                     }
         except (socket.error, ssl.SSLError, OSError) as e:
             return {'error': str(e)}
-    
-    def _fetch_with_retry(self, url: str, max_retries: int = DEFAULT_MAX_RETRIES) -> tuple:
-        """
-        Fetch URL with retry logic for transient failures.
-        
-        Args:
-            url: The URL to fetch
-            max_retries: Number of retries (default: 1)
-            
-        Returns:
-            Tuple of (response or None, error_message, attempt_count)
-        """
-        max_attempts = max_retries + 1
-        last_error = ""
-        
-        for attempt in range(1, max_attempts + 1):
-            try:
-                response = self.session.get(
-                    url, 
-                    timeout=DEFAULT_TIMEOUT_SECONDS, 
-                    verify=self.verify_certificates
-                )
-                response.raise_for_status()
-                return response, "", attempt
-                
-            except requests.exceptions.Timeout as e:
-                last_error = f"URI-RSA: HTTP error connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url}"
-                if attempt < max_attempts:
-                    continue  # Retry
-                    
-            except requests.exceptions.ConnectionError as e:
-                error_str = str(e).lower()
-                if 'refused' in error_str:
-                    last_error = f"URI-RSA: HTTP error connection refused for URL: {url}"
-                    if attempt < max_attempts:
-                        continue  # Retry
-                elif 'reset' in error_str:
-                    last_error = f"URI-RSA: HTTP error connection reset for URL: {url}"
-                    if attempt < max_attempts:
-                        continue  # Retry
-                elif 'remotedisconnected' in error_str or 'remote end closed' in error_str:
-                    last_error = f"URI-RSA: HTTP error connection remote end closed connection for URL: {url}"
-                    break  # Don't retry
-                elif 'max retries' in error_str or 'nameresolution' in error_str:
-                    domain = urlparse(url).netloc
-                    if 'nameresolution' in error_str:
-                        last_error = f"URI-RSA: HTTP error name resolution failed for {domain} at URL: {url}"
-                    else:
-                        last_error = f"URI-RSA: HTTP error connection max retries exceeded for URL: {url}"
-                    break  # Don't retry
-                else:
-                    last_error = f"URI-RSA: HTTP error connection max retries exceeded for URL: {url}"
-                    break  # Don't retry other connection errors
-                    
-            except requests.exceptions.SSLError as e:
-                last_error = self._categorize_ssl_error(str(e), url, attempt, max_attempts)
-                break  # Don't retry SSL errors
-                
-            except requests.exceptions.HTTPError as e:
-                domain = urlparse(url).netloc
-                last_error = f"URI-RSA: HTTP error {e.response.status_code} for {domain} at URL: {url}"
-                break  # Don't retry HTTP errors
-                
-            except Exception as e:
-                last_error = f"URI-RSA: HTTP error {str(e)[:100]} for URL: {url}"
-                break
-        
-        return None, last_error, attempt
-    
-    def _categorize_ssl_error(self, error_str: str, url: str, attempt: int = 1, max_attempts: int = 2) -> str:
-        """
-        Categorize SSL errors and return detailed, actionable error messages.
-        
-        Uses a table-driven approach for maintainability and readability.
-        """
-        parsed = urlparse(url)
-        hostname = parsed.netloc
-        error_lower = error_str.lower()
-        
-        # Lazy certificate info lookup - only fetch when needed
-        cert_info_cache = {}
-        def get_cert_info():
-            if 'data' not in cert_info_cache:
-                cert_info_cache['data'] = self._get_ssl_cert_info(hostname)
-            return cert_info_cache['data']
-        
-        # Table-driven error pattern matching: (patterns, message_func)
-        error_patterns = [
-            # Connection errors (these still use old format as they're handled in _fetch_with_retry)
-            (['timed out', 'timeout'],
-             lambda: f"URI-RSA: HTTP error connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url}"),
-            (['connection refused'],
-             lambda: f"URI-RSA: HTTP error connection refused for URL: {url}"),
-            (['connection reset'],
-             lambda: f"URI-RSA: HTTP error connection reset for URL: {url}"),
-            # SSL Certificate errors
-            (['certificate verify failed'],
-             lambda: f"URI-RSA: HTTP SSL certificate verification failed for {hostname} at URL: {url}"),
-            (['certificate has expired', 'cert_has_expired'],
-             lambda: f"URI-RSA: HTTP SSL certificate expired on {get_cert_info().get('expiration', 'unknown date')} for {hostname} at URL: {url}"),
-            (['self signed certificate in certificate chain'],
-             lambda: f"URI-RSA: HTTP SSL certificate chain contains self-signed cert (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
-            (['self signed certificate', 'self_signed_cert'],
-             lambda: f"URI-RSA: HTTP SSL certificate is self-signed (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
-            (['unable to get local issuer'],
-             lambda: f"URI-RSA: HTTP SSL certificate chain incomplete for {hostname} at URL: {url}"),
-            (['unknown ca', 'unable to get issuer'],
-             lambda: f"URI-RSA: HTTP SSL unknown CA \"{get_cert_info().get('issuer_name', 'unknown')}\" for {hostname} at URL: {url}"),
-            # SSLv3 handshake failure (specific pattern)
-            (['sslv3_alert_handshake_failure', 'sslv3 alert handshake'],
-             lambda: f"URI-RSA: HTTP SSL handshake failure due to SSLv3 handshake for {hostname} at URL: {url}"),
-            # General TLS handshake failure
-            (['handshake failure', 'handshake_failure'],
-             lambda: f"URI-RSA: HTTP SSL handshake failure due to older version {get_cert_info().get('tls_version', 'unknown')} for {hostname} at URL: {url}"),
-            # Unexpected EOF
-            (['unexpected_eof', 'unexpected eof'],
-             lambda: f"URI-RSA: HTTP SSL error unexpected EOF for {hostname} at URL: {url}"),
-        ]
-        
-        # Special case: hostname mismatch (requires compound check)
-        if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
-            cert_hosts = get_cert_info().get('hostnames', ['unknown'])
-            cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
-            return f"URI-RSA: HTTP SSL hostname mismatch for remote {cert_hosts_str} but expected {hostname} at URL: {url}"
-        
-        # Match against pattern table
-        for patterns, message_func in error_patterns:
-            if any(p in error_lower for p in patterns):
-                return message_func()
-        
-        # Generic fallback
-        return f"URI-RSA: HTTP SSL error {error_str[:100]} for {hostname} at URL: {url}"
-    
-    def _extract_domain(self, url: str) -> Optional[str]:
-        """
-        Extract domain from URL.
-        
-        Args:
-            url: The URL to extract domain from
-            
-        Returns:
-            Domain string or None if extraction fails
-        """
-        if not url or not isinstance(url, str):
-            return None
-        
-        # Normalize URL (ensure it has a scheme)
-        url = self._normalize_url(url)
-        try:
-            parsed = urlparse(url)
-            domain = parsed.netloc or parsed.path.split('/')[0]
-            # Basic domain validation
-            if domain and '.' in domain:
-                return domain
-            return None
-        except (ValueError, AttributeError) as e:
-            logger.debug(f"Failed to extract domain from {url}: {e}")
-            return None
-    
-    def _validate_proof_content(self, content_list: List[str], fingerprint: str) -> bool:
-        """Validate DNS-RSA proof content according to ContactInfo spec v2"""
-        # DNS-RSA requires "we-run-this-tor-relay" text
-        expected_proof = "we-run-this-tor-relay"
-        return any(expected_proof in content.lower() for content in content_list)
-    
+
+    # ------------------------------------------------------------------
+    # Parallel orchestration
+    # ------------------------------------------------------------------
+
     def validate_parallel(
-        self, 
+        self,
         relays: Optional[List[Dict]] = None,
         limit: Optional[int] = None,
         progress_callback: Optional[Callable] = None,
-        stop_check: Optional[Callable] = None
+        stop_check: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Validate relays in parallel using thread pool
-        
-        Args:
-            relays: List of relays to validate (fetches if None)
-            limit: Maximum number of relays to validate
-            progress_callback: Function to call with (current, total, result)
-            stop_check: Function that returns True if validation should stop
-        
-        Returns:
-            List of validation results
-        """
-        # Clear domain cache at start of each validation run
+        """Validate relays in parallel using thread pool."""
         self.clear_domain_cache()
-        
-        # Fetch relays if not provided
+
         if relays is None:
             relays = self.fetch_relay_data(limit)
         elif limit:
             relays = relays[:limit]
-        
+
         total_relays = len(relays)
-        results = []
+        results: List[Dict[str, Any]] = []
         completed = 0
-        
-        # Use ThreadPoolExecutor for parallel validation
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all validation tasks
             future_to_relay = {
-                executor.submit(self.validate_relay, relay): relay 
+                executor.submit(self.validate_relay, relay): relay
                 for relay in relays
             }
-            
-            # Process completed tasks as they finish
+
             for future in concurrent.futures.as_completed(future_to_relay):
-                # Check if we should stop
                 if stop_check and stop_check():
-                    # Cancel remaining futures
                     for f in future_to_relay:
                         f.cancel()
                     break
-                
+
                 relay = future_to_relay[future]
                 try:
                     result = future.result()
                     results.append(result)
                     completed += 1
-                    
-                    # Report progress
                     if progress_callback:
                         progress_callback(completed, total_relays, result)
-                        
                 except Exception as e:
-                    # Handle validation error
-                    error_result = {
-                        'nickname': relay.get('nickname', 'Unknown'),
-                        'fingerprint': relay.get('fingerprint', ''),
-                        'valid': False,
-                        'error': f"Validation exception: {str(e)}"
-                    }
+                    error_result = self._make_result_skeleton(relay)
+                    error_result['error'] = f"Validation exception: {str(e)}"
                     results.append(error_result)
                     completed += 1
-                    
                     if progress_callback:
                         progress_callback(completed, total_relays, error_result)
-        
-        # Log summary of domain cache results (single pass)
+
+        # Cache summary
         with self._domain_cache_lock:
             failed_count, success_count = 0, 0
-            failed_details = []
-            for domain, entry in self._domain_cache.items():
+            for cache_key, entry in self._domain_cache.items():
                 if entry['status'] == 'failed':
                     failed_count += 1
-                    failed_details.append((domain, entry.get('data', '')))
                 elif entry['status'] == 'success':
                     success_count += 1
             if failed_count:
-                logger.info(f"Domain cache: {failed_count} domains unreachable (after max attempts)")
-                for domain, error in failed_details:
-                    logger.debug(f"  - {domain}: {error[:80] if error else 'unknown error'}")
+                logger.info(f"Domain cache: {failed_count} (domain,proof) entries unreachable")
             if success_count:
-                logger.info(f"Domain cache: {success_count} domains reachable and cached")
-        
+                logger.info(f"Domain cache: {success_count} (domain,proof) entries cached")
+
         return results
 
+
+# ============================================================================
+# Module-level entry points (used by CLI/UI)
+# ============================================================================
 
 def run_validation(
     progress_callback: Optional[Callable] = None,
@@ -875,74 +1584,52 @@ def run_validation(
     parallel: bool = True,
     max_workers: int = 20,
     verify_certificates: bool = DEFAULT_VERIFY_CERTIFICATES,
-    allow_legacy_tls: bool = DEFAULT_ALLOW_LEGACY_TLS
+    allow_legacy_tls: bool = DEFAULT_ALLOW_LEGACY_TLS,
+    supported_ciissversions: Sequence[str] = SUPPORTED_CIISSVERSIONS_DEFAULT,
 ) -> List[Dict[str, Any]]:
-    """
-    Run AROI validation with optional parallel processing.
-    
-    Args:
-        progress_callback: Function to call with (current, total, result)
-        stop_check: Function that returns True if validation should stop
-        limit: Maximum relays to validate (None for all)
-        parallel: Whether to use parallel processing
-        max_workers: Number of parallel workers (1-100, validated by ParallelAROIValidator)
-        verify_certificates: Whether to verify SSL certificates
-        allow_legacy_tls: Whether to allow legacy TLS settings
-    
-    Returns:
-        List of validation results
-    """
-    # ParallelAROIValidator handles max_workers validation and capping
+    """Run AROI validation with optional parallel processing."""
     validator = ParallelAROIValidator(
         max_workers=max_workers if parallel else 1,
         verify_certificates=verify_certificates,
-        allow_legacy_tls=allow_legacy_tls
+        allow_legacy_tls=allow_legacy_tls,
+        supported_ciissversions=supported_ciissversions,
     )
-    
+
     if parallel:
-        logger.info(f"Using parallel validation with {validator.max_workers} workers")
+        logger.info(
+            f"Using parallel validation with {validator.max_workers} workers, "
+            f"ciissversions={','.join(validator._supported_ciissversions)}"
+        )
         return validator.validate_parallel(
             limit=limit,
             progress_callback=progress_callback,
-            stop_check=stop_check
+            stop_check=stop_check,
         )
-    
-    # Sequential validation
-    logger.info("Using sequential validation")
+
+    logger.info(
+        f"Using sequential validation, ciissversions={','.join(validator._supported_ciissversions)}"
+    )
     relays = validator.fetch_relay_data(limit)
     results = []
     total = len(relays)
-    
     for idx, relay in enumerate(relays, 1):
         if stop_check and stop_check():
             break
-        
         result = validator.validate_relay(relay)
         results.append(result)
-        
         if progress_callback:
             progress_callback(idx, total, result)
-    
     return results
 
 
 def results_to_dataframe(results: list, include_error: bool = False) -> "pd.DataFrame":
-    """
-    Convert validation results to a pandas DataFrame.
-    
-    Args:
-        results: List of validation result dictionaries
-        include_error: Whether to include the error column
-        
-    Returns:
-        pandas DataFrame with formatted results
-    """
+    """Convert validation results to a pandas DataFrame."""
     import pandas as pd
-    
+
     columns = ['Nickname', 'Fingerprint', 'Valid', 'Proof Type', 'Domain']
     if include_error:
         columns.append('Error')
-    
+
     df_data = [
         {
             'Nickname': r.get('nickname', 'Unknown'),
@@ -950,170 +1637,280 @@ def results_to_dataframe(results: list, include_error: bool = False) -> "pd.Data
             'Valid': '✅' if r.get('valid') else '❌',
             'Proof Type': r.get('proof_type') or 'None',
             'Domain': r.get('domain') or 'N/A',
-            **(({'Error': r.get('error') or ''}) if include_error else {})
+            **(({'Error': r.get('error') or ''}) if include_error else {}),
         }
         for r in results
     ]
-    
+
     return pd.DataFrame(df_data, columns=columns)
 
+
+# ============================================================================
+# Statistics
+# ============================================================================
 
 def calculate_statistics(results: List[Dict]) -> Dict:
     """Calculate validation statistics in a single pass through results."""
     total_relays = len(results)
     valid_relays = 0
-    
-    # Counters for proof types: [total, valid]
-    dns_rsa = [0, 0]
-    uri_rsa = [0, 0]
-    no_proof = 0
-    
-    # Single pass through results
+
+    # Per-proof-type counters: proof_type_str -> [total, valid]
+    proof_counters: Dict[str, List[int]] = {}
+    no_proof_total = 0
+    no_aroi = 0  # no ciissversion at all
+    ciissv3_no_url = 0  # ciissversion:3 with informational fields only
+
+    # ciissversion distribution counters
+    declared: Dict[str, int] = {}  # what relays declared in ContactInfo
+    validated: Dict[str, int] = {}  # what this run actually validated (had spec lookup)
+    filtered_out = 0
+
+    # v3 failure category tally
+    v3_failure_categories: Dict[str, int] = {k: 0 for k in CATEGORY_INFO.keys()}
+
     for r in results:
         is_valid = r.get('valid', False)
         if is_valid:
             valid_relays += 1
-        
+
         proof_type = r.get('proof_type')
-        if proof_type == PROOF_TYPE_DNS_RSA:
-            dns_rsa[0] += 1
+        if proof_type:
+            key = proof_type.replace('-', '_')
+            counter = proof_counters.setdefault(key, [0, 0])
+            counter[0] += 1
             if is_valid:
-                dns_rsa[1] += 1
-        elif proof_type == PROOF_TYPE_URI_RSA:
-            uri_rsa[0] += 1
-            if is_valid:
-                uri_rsa[1] += 1
+                counter[1] += 1
         else:
-            no_proof += 1
-    
+            no_proof_total += 1
+            # ciissversion3_no_url only counts SPEC-COMPLIANT v3 relays that
+            # declared ciissversion:3 with informational fields and no url.
+            # Such relays have ciissversion='3', proof_type=None, error=None.
+            # Filtered-out / unsupported relays have error set (and category
+            # 'ciissversion_unsupported'), so they go in no_aroi here too.
+            if (r.get('ciissversion') == '3'
+                    and r.get('error') is None):
+                ciissv3_no_url += 1
+            else:
+                no_aroi += 1
+
+        # ciissversion distribution
+        version = r.get('ciissversion')
+        if version is None:
+            declared['none'] = declared.get('none', 0) + 1
+        else:
+            declared[version] = declared.get(version, 0) + 1
+
+        # validated bucket: only counts when we actually had a spec to apply or
+        # made a definitive ciissversion-aware decision (any relay where
+        # validate_relay reached past the version-supported check).
+        if r.get('error_category') == 'ciissversion_unsupported':
+            filtered_out += 1
+        elif version is None:
+            validated['none'] = validated.get('none', 0) + 1
+        else:
+            validated[version] = validated.get(version, 0) + 1
+
+        # v3 failure categories: count any v3 result with an error_category.
+        if version == '3':
+            cat = r.get('error_category')
+            if cat and cat in v3_failure_categories:
+                v3_failure_categories[cat] += 1
+
     def calc_rate(valid: int, total: int) -> float:
         return (valid / total * 100) if total > 0 else 0.0
-    
+
+    proof_types_block: Dict[str, Dict[str, Any]] = {
+        key: {
+            'total': counts[0],
+            'valid': counts[1],
+            'success_rate': calc_rate(counts[1], counts[0]),
+        }
+        for key, counts in proof_counters.items()
+    }
+    # Symmetric output: every proof type known to this build is always present
+    # (with zero counts if not observed). Lets downstream renderers iterate
+    # without needing "treat as optional" defensive code paths.
+    for (_v, ptype) in PROOF_SPECS.keys():
+        proof_types_block.setdefault(
+            ptype.replace('-', '_'),
+            {'total': 0, 'valid': 0, 'success_rate': 0.0},
+        )
+
+    proof_types_block['no_proof'] = {
+        'total': no_proof_total,
+        'no_aroi': no_aroi,
+        'ciissversion3_no_url': ciissv3_no_url,
+    }
+
     return {
         'total_relays': total_relays,
         'valid_relays': valid_relays,
         'invalid_relays': total_relays - valid_relays,
         'success_rate': calc_rate(valid_relays, total_relays),
-        'proof_types': {
-            'dns_rsa': {
-                'total': dns_rsa[0],
-                'valid': dns_rsa[1],
-                'success_rate': calc_rate(dns_rsa[1], dns_rsa[0])
-            },
-            'uri_rsa': {
-                'total': uri_rsa[0],
-                'valid': uri_rsa[1],
-                'success_rate': calc_rate(uri_rsa[1], uri_rsa[0])
-            },
-            'no_proof': {
-                'total': no_proof
-            }
-        }
+        'proof_types': proof_types_block,
+        'ciissversion_declared': declared,
+        'ciissversion_validated': {**validated, 'filtered_out': filtered_out},
+        'v3_failure_categories': v3_failure_categories,
     }
 
 
+# ============================================================================
+# Migration insights formatter (used by `aroi_cli.py insights`)
+# ============================================================================
+
+def format_migration_insights(stats: Dict, results: List[Dict]) -> str:
+    """Render a human-readable ciissversion:2 → ciissversion:3 migration summary."""
+    lines: List[str] = []
+
+    declared = stats.get('ciissversion_declared', {}) or {}
+    declared_total = sum(declared.values()) or 1
+    lines.append("=== ciissversion declared by relays (in Onionoo) ===")
+    for v in sorted(declared.keys()):
+        label = f"ciissversion:{v}" if v != 'none' else "none"
+        lines.append(f"  {label:<22} {declared[v]:>6} relays  ({declared[v] / declared_total * 100:5.1f}%)")
+
+    validated = stats.get('ciissversion_validated', {}) or {}
+    if validated:
+        lines.append("")
+        lines.append("=== ciissversion validated by this run ===")
+        for v in sorted(k for k in validated if k != 'filtered_out'):
+            label = f"ciissversion:{v}" if v != 'none' else "none"
+            lines.append(f"  {label:<22} {validated[v]:>6} relays  validated")
+        if validated.get('filtered_out'):
+            lines.append(f"  {'(filtered out)':<22} {validated['filtered_out']:>6} relays  skipped by --ciiss-versions")
+
+    proof_types = stats.get('proof_types', {}) or {}
+    v3_proof_keys = [k for k in proof_types if 'familyid' in k]
+    if v3_proof_keys:
+        lines.append("")
+        lines.append("=== ciissversion:3 validity breakdown ===")
+        for k in sorted(v3_proof_keys):
+            info = proof_types[k]
+            lines.append(
+                f"  {k:<26} {info['total']:>6} relays  "
+                f"{info['valid']:>4} valid ({info['success_rate']:5.1f}%)"
+            )
+
+    # Render failure categories. "Actionable" categories (operator can fix
+    # something specific) sort first by count desc; transport_error and
+    # ciissversion_unsupported are appended after as they're either
+    # transient/diagnostic or operator-policy-level rather than per-relay
+    # actionable. All non-zero categories are surfaced — none silently dropped.
+    cats = stats.get('v3_failure_categories', {}) or {}
+    _NON_ACTIONABLE = ('transport_error', 'ciissversion_unsupported')
+    actionable = sorted(
+        ((k, v) for k, v in cats.items() if v > 0 and k not in _NON_ACTIONABLE),
+        key=lambda kv: -kv[1],
+    )
+    if actionable:
+        lines.append("")
+        lines.append("=== ciissversion:3 failure root causes (actionable) ===")
+        for cat, count in actionable:
+            info = CATEGORY_INFO.get(cat, {})
+            title = info.get('title') or cat
+            action = info.get('action') or "(see error detail)"
+            lines.append(f"  {count:>4}  {title}")
+            lines.append(f"        → {action}")
+
+    for cat in _NON_ACTIONABLE:
+        count = cats.get(cat, 0)
+        if not count:
+            continue
+        info = CATEGORY_INFO.get(cat, {})
+        title = info.get('title') or cat
+        action = info.get('action') or "(see error detail)"
+        lines.append("")
+        lines.append(f"  {count:>4}  {title}")
+        lines.append(f"        → {action}")
+
+    valid_v2 = sum(
+        1 for r in results
+        if r.get('ciissversion') == '2' and r.get('valid')
+    )
+    if valid_v2:
+        lines.append("")
+        lines.append("=== ciissversion:2 → ciissversion:3 upgrade candidates ===")
+        lines.append(
+            f"  {valid_v2} ciissversion:2 relays are currently valid — "
+            "these operators can migrate cleanly when ready"
+        )
+
+    leaked = cats.get('secret_key_leaked', 0)
+    lines.append("")
+    if leaked == 0:
+        lines.append("(!) 0 relays appear to have leaked .secret_family_key. Good.")
+    else:
+        lines.append(
+            f"(!!) {leaked} relays appear to have leaked .secret_family_key. "
+            "Investigate immediately and notify operators."
+        )
+
+    return "\n".join(lines)
+
+
+# ============================================================================
+# Persistence
+# ============================================================================
+
 def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
-    """
-    Save validation results to JSON file.
-    
-    Args:
-        results: List of validation results to save
-        filename: Optional custom filename (will be sanitized)
-        
-    Returns:
-        Path to the saved file
-        
-    Raises:
-        ValueError: If the filename is invalid
-        OSError: If the file cannot be written
-    """
+    """Save validation results to JSON file."""
     results_dir = Path('validation_results').resolve()
     results_dir.mkdir(exist_ok=True)
-    
+
     if filename is None:
         filename = f"aroi_validation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     else:
         filename = _sanitize_filename(filename)
-    
+
     statistics = calculate_statistics(results)
-    
-    # Metadata is a subset of statistics plus timestamp (avoid duplication)
+
     output_data = {
         'metadata': {
             'timestamp': datetime.now().isoformat(),
-            **{k: statistics[k] for k in ('total_relays', 'valid_relays', 'invalid_relays', 'success_rate')}
+            'aroivalidator_schema_version': AROIVALIDATOR_SCHEMA_VERSION,
+            **{k: statistics[k] for k in ('total_relays', 'valid_relays', 'invalid_relays', 'success_rate')},
         },
         'statistics': statistics,
-        'results': results
+        'results': results,
     }
-    
-    # Write to both timestamped file and latest.json
+
     file_path = results_dir / filename
     json_content = json.dumps(output_data, indent=2)
-    
+
     file_path.write_text(json_content)
     (results_dir / 'latest.json').write_text(json_content)
-    
+
     return file_path
 
 
 def _sanitize_filename(filename: str) -> str:
-    """
-    Sanitize filename to prevent path traversal attacks.
-    
-    Args:
-        filename: The filename to sanitize
-        
-    Returns:
-        Sanitized filename with only the base name component
-        
-    Raises:
-        ValueError: If the filename is invalid or empty after sanitization
-    """
+    """Sanitize filename to prevent path traversal attacks."""
     if not filename:
         raise ValueError("Filename cannot be empty")
-    
-    # Get only the base name to prevent path traversal
+
     safe_name = Path(filename).name
-    
-    # Validate constraints
     if not safe_name.endswith('.json'):
         raise ValueError("Invalid filename: must end with .json")
-    
     if safe_name.startswith('.'):
         raise ValueError("Invalid filename: hidden files not allowed")
-    
-    # Use pre-computed frozenset for O(1) character validation
     if not all(c in _ALLOWED_FILENAME_CHARS for c in safe_name):
         raise ValueError("Invalid filename: contains invalid characters")
-    
     return safe_name
 
 
 def load_results(filename: str = 'latest.json') -> Optional[Dict]:
-    """
-    Load validation results from JSON file.
-    
-    Args:
-        filename: Name of the file to load (must be within validation_results directory)
-        
-    Returns:
-        Parsed JSON data or None if file doesn't exist or is invalid
-        
-    Security:
-        Filename is sanitized to prevent path traversal attacks.
-    """
+    """Load validation results from JSON file."""
     try:
         safe_filename = _sanitize_filename(filename)
     except ValueError as e:
         logger.warning(f"Invalid filename rejected: {filename} - {e}")
         return None
-    
+
     file_path = Path('validation_results').resolve() / safe_filename
-    
+
     if not file_path.exists():
         return None
-    
+
     try:
         return json.loads(file_path.read_text())
     except json.JSONDecodeError as e:
@@ -1125,35 +1922,30 @@ def load_results(filename: str = 'latest.json') -> Optional[Dict]:
 
 
 def list_result_files() -> List[Path]:
-    """List all available result files"""
+    """List all available result files."""
     results_dir = Path('validation_results')
-    
     if not results_dir.exists():
         return []
-    
     json_files = list(results_dir.glob('aroi_validation_*.json'))
     json_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-    
     return json_files
 
 
 if __name__ == "__main__":
-    # Test parallel validation
-    print("Testing Parallel AROI Validator")
+    print("Testing Parallel AROI Validator (CIISS v2 + v3)")
     print("=" * 50)
-    
+
     def progress_callback(current, total, result):
         status = "✓" if result['valid'] else "✗"
         print(f"[{current}/{total}] {status} {result.get('nickname', 'Unknown')}")
-    
-    # Test with 10 relays using parallel processing
+
     results = run_validation(
         progress_callback=progress_callback,
         limit=10,
         parallel=True,
-        max_workers=5
+        max_workers=5,
     )
-    
+
     stats = calculate_statistics(results)
     print("\n" + "=" * 50)
     print(f"Total: {stats['total_relays']}, Valid: {stats['valid_relays']} ({stats['success_rate']:.1f}%)")
