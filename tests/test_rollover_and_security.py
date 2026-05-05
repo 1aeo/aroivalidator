@@ -22,6 +22,8 @@ from aroi_validator import (
     is_safe_public_host,
     _ip_is_safe,
     _clear_host_safety_cache,
+    _safe_create_connection,
+    SSRFBlockedError,
 )
 
 
@@ -259,6 +261,77 @@ def test_uri_validation_blocked_for_private_resolution():
     print(f"  ✓ url:localhost rejected with error_category={out['error_category']}")
 
 
+def test_dns_rebinding_blocked_at_connect():
+    """DNS-rebinding attack: an attacker's DNS server returns a public IP
+    for the pre-flight is_safe_public_host() check, then a private IP
+    when urllib3 resolves the same hostname for the actual fetch.
+
+    The pre-flight is informational; the SECURITY guarantee comes from
+    _safe_create_connection (the function urllib3 uses to open every
+    socket on the relay-fetch session). This test:
+
+      1. Primes the host-safety cache as if pre-flight passed (host is
+         marked safe with a public IP).
+      2. Mocks getaddrinfo to return a private IP — simulating the
+         attacker's DNS flipping its answer between the safety lookup
+         and the actual connect.
+      3. Calls _safe_create_connection directly. It must raise
+         SSRFBlockedError BEFORE opening a TCP socket. We patch
+         socket.socket as a tripwire to confirm no socket is ever
+         constructed.
+    """
+    _clear_host_safety_cache()
+
+    # Step 1: simulate successful pre-flight by force-priming the cache.
+    from aroi_validator import _HOST_SAFETY_CACHE, _HOST_SAFETY_LOCK
+    with _HOST_SAFETY_LOCK:
+        _HOST_SAFETY_CACHE['attacker.invalid'] = (True, '93.184.216.34')
+
+    # Step 2 + 3: connect-time getaddrinfo returns a private IP (rebinding).
+    # No socket should ever be created — the gate must reject before
+    # constructing the AF_INET socket.
+    private_info = [
+        (socket.AF_INET, socket.SOCK_STREAM, 0, '', ('127.0.0.1', 0)),
+    ]
+    socket_constructed = {'count': 0}
+
+    real_socket = socket.socket
+    def tripwire_socket(*args, **kwargs):
+        socket_constructed['count'] += 1
+        return real_socket(*args, **kwargs)
+
+    raised = None
+    with patch('aroi_validator.socket.getaddrinfo', return_value=private_info), \
+         patch('aroi_validator.socket.socket', side_effect=tripwire_socket):
+        try:
+            sock = _safe_create_connection(('attacker.invalid', 443), timeout=2)
+            sock.close()  # safety; should not be reached
+        except SSRFBlockedError as e:
+            raised = e
+        except OSError as e:
+            # If a different OSError subclass leaks out, only acceptable if
+            # the message clearly tags this as an SSRF block.
+            if 'SSRF' not in str(e) and 'non-public' not in str(e):
+                raise AssertionError(
+                    f"DNS rebinding NOT blocked: got non-SSRF OSError {e!r}"
+                )
+            raised = e
+
+    assert raised is not None, (
+        "DNS rebinding NOT blocked: _safe_create_connection returned a "
+        "socket to the rebound private IP"
+    )
+    assert socket_constructed['count'] == 0, (
+        f"socket() was called {socket_constructed['count']} time(s); "
+        f"connect-time gate must reject BEFORE constructing a socket"
+    )
+    msg = str(raised)
+    assert 'SSRF' in msg or 'non-public' in msg, (
+        f"SSRFBlockedError message should mention the rejection: {msg!r}"
+    )
+    print("  ✓ DNS rebinding blocked at connect: SSRFBlockedError raised, no socket opened")
+
+
 def test_redirect_both_primary_and_www_fail():
     """When BOTH primary and www-fallback return 3xx redirects, the relay
     fails with category=redirect_disallowed. allow_redirects=False asserted."""
@@ -349,6 +422,7 @@ def main():
     test_is_safe_public_host_rejects_private_resolution()
     test_uri_validation_blocked_for_ip_literal()
     test_uri_validation_blocked_for_private_resolution()
+    test_dns_rebinding_blocked_at_connect()
     test_redirect_both_primary_and_www_fail()
     test_redirect_primary_recovered_via_www()
     print("\nAll mocked-input tests passed.")

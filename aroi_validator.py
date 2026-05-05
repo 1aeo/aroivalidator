@@ -211,6 +211,170 @@ def _clear_host_safety_cache() -> None:
         _HOST_SAFETY_CACHE.clear()
 
 
+# ----------------------------------------------------------------------------
+# DNS-rebinding-safe connection layer
+# ----------------------------------------------------------------------------
+# The pre-flight is_safe_public_host() check is necessary but NOT sufficient:
+# an attacker who controls the authoritative DNS for url:<their-domain> can
+# return a public IP for the safety lookup, then return 127.0.0.1 (or the
+# AWS metadata IP, or RFC1918) when `requests` does its own resolution for
+# the actual fetch. To close that DNS-rebinding window, we replace urllib3's
+# connection-time create_connection with one that:
+#   1. Does its own atomic getaddrinfo at connect time.
+#   2. Filters returned addrinfos through _ip_is_safe.
+#   3. Connects only to IPs that survived the filter.
+#   4. Fails closed (raises) if no safe IPs remain.
+# This function is what actually opens the socket the HTTPS request uses,
+# so there is no resolve→connect window left for an attacker.
+
+class SSRFBlockedError(OSError):
+    """Raised when a connection target resolves to a non-public address."""
+
+
+def _safe_create_connection(
+    address,
+    timeout=socket._GLOBAL_DEFAULT_TIMEOUT,  # type: ignore[attr-defined]
+    source_address=None,
+    socket_options=None,
+):
+    """create_connection variant that refuses non-globally-routable targets.
+
+    Mirrors urllib3.util.connection.create_connection but inserts an
+    address-filter step between getaddrinfo and connect. Raises
+    SSRFBlockedError (an OSError subclass so urllib3 wraps it as a
+    NewConnectionError) if every resolved address fails _ip_is_safe.
+    """
+    host, port = address
+    if isinstance(host, str) and host.startswith("["):
+        host = host.strip("[]")
+
+    # Reject IP-literal hosts outright. (urllib3 may pass us a literal if
+    # the URL was https://1.2.3.4/...; defense-in-depth.)
+    try:
+        ip_obj = ipaddress.ip_address(host)
+        if not _ip_is_safe(host):
+            raise SSRFBlockedError(
+                f"SSRF-blocked: refusing to connect to non-public IP literal {host}"
+            )
+        # If host is itself a safe IP literal, fall through to the loop below
+        # which will hit the same address via getaddrinfo's passthrough.
+        del ip_obj
+    except ValueError:
+        pass  # not an IP literal, normal hostname
+
+    err = None
+    safe_seen = False
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except socket.gaierror:
+        raise  # surface as urllib3 NameResolutionError
+
+    for af, socktype, proto, _canon, sa in infos:
+        ip_str = sa[0]
+        if not _ip_is_safe(ip_str):
+            err = err or SSRFBlockedError(
+                f"SSRF-blocked: refusing to connect to non-public address "
+                f"{ip_str} for host {host}"
+            )
+            continue
+        safe_seen = True
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            if socket_options:
+                for opt in socket_options:
+                    sock.setsockopt(*opt)
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:  # type: ignore[attr-defined]
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sa)
+            return sock
+        except OSError as e:
+            err = e
+            if sock is not None:
+                sock.close()
+
+    # Fail closed: if every addr was unsafe, raise SSRFBlockedError; if
+    # the only failures were transport-level errors (or the list was
+    # empty), surface those.
+    if not safe_seen:
+        raise SSRFBlockedError(
+            f"SSRF-blocked: no globally-routable address available for {host}"
+        )
+    if err is not None:
+        raise err
+    raise OSError(f"getaddrinfo returned no addresses for {host}")
+
+
+# urllib3 connection subclasses that route through _safe_create_connection.
+# Subclassing rather than monkey-patching keeps the SSRF gate scoped to the
+# adapter we install on the relay-fetch session — Onionoo connections (which
+# use a different session config / well-known torproject.org host) are not
+# affected.
+from urllib3.connection import HTTPConnection as _Urllib3HTTPConnection
+from urllib3.connection import HTTPSConnection as _Urllib3HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool as _Urllib3HTTPConnectionPool
+from urllib3.connectionpool import HTTPSConnectionPool as _Urllib3HTTPSConnectionPool
+from urllib3.poolmanager import PoolManager as _Urllib3PoolManager
+
+
+class _SSRFSafeHTTPConnection(_Urllib3HTTPConnection):
+    def _new_conn(self):
+        from urllib3.exceptions import NameResolutionError, NewConnectionError
+        try:
+            sock = _safe_create_connection(
+                (self._dns_host, self.port),
+                self.timeout,
+                source_address=self.source_address,
+                socket_options=self.socket_options,
+            )
+        except SSRFBlockedError as e:
+            # Surface as a NewConnectionError so the requests layer gets
+            # a ConnectionError (not a generic OSError); the message is
+            # what user code reads.
+            raise NewConnectionError(self, str(e)) from e
+        except socket.gaierror as e:
+            raise NameResolutionError(self.host, self, e) from e
+        return sock
+
+
+class _SSRFSafeHTTPSConnection(_Urllib3HTTPSConnection):
+    def _new_conn(self):
+        from urllib3.exceptions import NameResolutionError, NewConnectionError
+        try:
+            sock = _safe_create_connection(
+                (self._dns_host, self.port),
+                self.timeout,
+                source_address=self.source_address,
+                socket_options=self.socket_options,
+            )
+        except SSRFBlockedError as e:
+            raise NewConnectionError(self, str(e)) from e
+        except socket.gaierror as e:
+            raise NameResolutionError(self.host, self, e) from e
+        return sock
+
+
+class _SSRFSafeHTTPConnectionPool(_Urllib3HTTPConnectionPool):
+    ConnectionCls = _SSRFSafeHTTPConnection
+
+
+class _SSRFSafeHTTPSConnectionPool(_Urllib3HTTPSConnectionPool):
+    ConnectionCls = _SSRFSafeHTTPSConnection
+
+
+class _SSRFSafePoolManager(_Urllib3PoolManager):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Override the per-scheme pool classes so every connection opened
+        # through this PoolManager uses our SSRF-safe _new_conn.
+        self.pool_classes_by_scheme = {
+            "http": _SSRFSafeHTTPConnectionPool,
+            "https": _SSRFSafeHTTPSConnectionPool,
+        }
+
+
 def _looks_like_secret_key(content_lines: List[str]) -> bool:
     """Detect whether published proof content appears to contain .secret_family_key.
 
@@ -442,10 +606,13 @@ def parse_ciissversions_flag(s: str) -> Tuple[str, ...]:
 
 
 class SecureTLSAdapter(requests.adapters.HTTPAdapter):
-    """TLS adapter with configurable security settings.
+    """TLS adapter with configurable security settings + SSRF-safe connect.
 
-    By default uses secure settings (TLS 1.2+, certificate verification).
-    Can be configured for legacy server compatibility when explicitly needed.
+    Uses _SSRFSafePoolManager so every TCP connection opened by this
+    adapter resolves AND connects atomically, only to globally-routable
+    IPs. This closes the DNS-rebinding window between any pre-flight
+    safety check and the actual fetch — the IP that's connected to IS
+    the IP that was vetted, in the same getaddrinfo call.
     """
 
     def __init__(self, verify_certificates: bool = True, allow_legacy_tls: bool = False, **kwargs):
@@ -453,7 +620,7 @@ class SecureTLSAdapter(requests.adapters.HTTPAdapter):
         self.allow_legacy_tls = allow_legacy_tls
         super().__init__(**kwargs)
 
-    def init_poolmanager(self, *args, **kwargs):
+    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
         ctx = ssl.create_default_context()
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
@@ -468,8 +635,16 @@ class SecureTLSAdapter(requests.adapters.HTTPAdapter):
         if self.allow_legacy_tls:
             ctx.set_ciphers('DEFAULT@SECLEVEL=1')
 
-        kwargs['ssl_context'] = ctx
-        return super().init_poolmanager(*args, **kwargs)
+        pool_kwargs['ssl_context'] = ctx
+        # Wire our SSRF-safe pool manager (subclasses urllib3's PoolManager
+        # to swap in connection classes whose _new_conn refuses non-public
+        # addresses at connect time).
+        self.poolmanager = _SSRFSafePoolManager(
+            num_pools=connections,
+            maxsize=maxsize,
+            block=block,
+            **pool_kwargs,
+        )
 
 
 class ParallelAROIValidator:

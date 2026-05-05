@@ -140,19 +140,36 @@ Results saved to `validation_results/` as JSON:
 Relay `ContactInfo url:` is operator-provided and untrusted. The validator
 fetches `https://<that-host>/.well-known/...` for v2 `uri-rsa` and v3
 `uri-familyid-ed25519` proofs, so a malicious operator could otherwise
-point us at internal infrastructure. Three-layer mitigation:
+point us at internal infrastructure (loopback, cloud metadata, RFC1918)
+or use **DNS rebinding** to flip the IP between safety check and connect.
 
-1. **IP-literal hostnames are rejected outright.** A relay that publishes
-   `url:127.0.0.1` or `url:169.254.169.254` (cloud metadata IP) gets
-   `error_category: unsafe_target` before any network connect.
-2. **DNS-resolved addresses are checked.** The hostname is resolved
-   (A and AAAA) and rejected if any returned address is in a
-   loopback / private (RFC1918, RFC4193) / link-local / multicast /
-   reserved / unspecified range.
-3. **HTTP redirects are disabled** (`allow_redirects=False`). A 3xx
+The validator's protection is **enforced at the actual connect call**, not
+just by a separate pre-flight resolve. Specifically:
+
+1. **IP-literal hostnames are rejected outright** before any DNS work.
+2. **`is_safe_public_host()` pre-flight** rejects `url:` values whose
+   `getaddrinfo` returns no globally-routable address. This is a cheap
+   fast-path that produces a clean `unsafe_target` error without burning
+   a TCP attempt; it is **not the security boundary**.
+3. **`_safe_create_connection()` is the authoritative gate.** Every TCP
+   connection opened by the relay-fetch session goes through a custom
+   urllib3 connection class that performs **its own** `getaddrinfo` at
+   connect time, filters the addrinfos through the same `_ip_is_safe()`
+   predicate as the pre-flight, and connects ONLY to surviving
+   globally-routable IPs. The IP that's connected to IS the IP that was
+   vetted, in the same `getaddrinfo` call. **No DNS rebinding window**
+   exists between the safety check and the connect, because they are
+   the same syscall.
+4. **Fail closed.** If every resolved address is non-public, the connect
+   raises `SSRFBlockedError` (an `OSError` subclass), which urllib3
+   wraps as `NewConnectionError` and `requests` surfaces as a
+   `ConnectionError` — handled in `_fetch_with_retry` like any other
+   transport failure.
+5. **HTTP redirects are disabled** (`allow_redirects=False`). A 3xx
    response is never followed by `requests` (`Location` could otherwise
-   point into private space). CIISS spec also mandates "MUST NOT
-   redirect to another domain" on the proof URI.
+   bypass the connect-time gate by triggering a fresh resolve to a
+   different host). CIISS spec also mandates "MUST NOT redirect to
+   another domain" on the proof URI.
 
    **Behavior on 3xx response:** A primary-URL 3xx is **not** an
    automatic failure. The validator still tries the **www-fallback**
@@ -165,16 +182,18 @@ point us at internal infrastructure. Three-layer mitigation:
    most actionable `error_category` (`uri_file_missing` > `redirect_disallowed`
    > `transport_error`).
 
+The connect-time gate is scoped to the relay-fetch `requests.Session`
+(via the custom `SecureTLSAdapter` mounting `_SSRFSafePoolManager`).
+Onionoo connections (a fixed, trusted endpoint at
+`onionoo.torproject.org`) go through the same session in this codebase,
+which is fine because the safe-public-host check accepts any globally
+routable address — Onionoo's IPs are public.
+
 Tests for these protections live in `tests/test_rollover_and_security.py`
 (`test_ip_safety_classification`, `test_is_safe_public_host_*`,
-`test_uri_validation_blocked_*`, `test_redirect_disallowed`). Run them with
-`pytest` or directly via `python3 tests/test_rollover_and_security.py`.
-
-There is a residual TOCTOU window between our pre-flight DNS check and
-`requests`' own resolution. For threat models that require eliminating
-this, a custom HTTPAdapter that pins the resolved IP would be needed
-(out of scope today; the current mitigation catches the entire realistic
-threat surface — a relay operator publishing a private/loopback URL).
+`test_uri_validation_blocked_*`, `test_dns_rebinding_blocked`,
+`test_redirect_*`). Run them with `pytest` or directly via
+`python3 tests/test_rollover_and_security.py`.
 
 ### TLS/SSL Configuration
 
