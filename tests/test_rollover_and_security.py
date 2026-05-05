@@ -234,10 +234,9 @@ def test_uri_validation_blocked_for_private_resolution():
     print(f"  ✓ url:localhost rejected with error_category={out['error_category']}")
 
 
-def test_redirect_disallowed():
-    """An HTTP redirect on the proof URI must NOT be followed (CIISS spec)
-    and must produce a single redirect_disallowed error containing the
-    Location header for diagnostic value."""
+def test_redirect_both_primary_and_www_fail():
+    """When BOTH primary and www-fallback return 3xx redirects, the relay
+    fails with category=redirect_disallowed. allow_redirects=False asserted."""
     _clear_host_safety_cache()
     v = ParallelAROIValidator(max_workers=1)
     relay = {
@@ -246,24 +245,23 @@ def test_redirect_disallowed():
         'family_ids': ['fid'],
         'contact': 'url:public.invalid proof:uri-familyid-ed25519 ciissversion:3',
     }
-    fake_response = MagicMock()
-    fake_response.status_code = 301
-    fake_response.headers = {'Location': 'https://attacker.invalid/somewhere'}
+    fake_3xx = MagicMock()
+    fake_3xx.status_code = 301
+    fake_3xx.headers = {'Location': 'https://attacker.invalid/somewhere'}
 
-    with patch.object(v.session, 'get', return_value=fake_response) as mock_get:
+    with patch.object(v.session, 'get', return_value=fake_3xx) as mock_get:
         out = v.validate_relay(relay)
 
-    # session.get called with allow_redirects=False (SSRF defense).
+    # SSRF defense: allow_redirects=False on every call.
     assert mock_get.call_count >= 1
     for call in mock_get.call_args_list:
         assert call.kwargs.get('allow_redirects') is False, (
             f"allow_redirects must be False for SSRF defense; got {call.kwargs}"
         )
 
-    # Skipping www-fallback for redirects: primary 301 should NOT trigger
-    # a second fetch (operator's redirect policy applies equally to www).
-    assert mock_get.call_count == 1, (
-        f"www-fallback should be skipped for redirects; "
+    # Both primary and www-fallback are tried (3xx is not a fast-fail).
+    assert mock_get.call_count == 2, (
+        f"both primary + www-fallback should be attempted on 3xx; "
         f"session.get was called {mock_get.call_count} times"
     )
 
@@ -272,11 +270,47 @@ def test_redirect_disallowed():
     # Error must include status code AND the Location header for diagnostics
     assert '301' in out['error'], out
     assert 'https://attacker.invalid/somewhere' in out['error'], out
-    # And must NOT be the duplicated-via-www message
-    assert out['error'].count('HTTP redirect') == 1, (
-        f"redirect error should appear once, not duplicated via www: {out['error']!r}"
-    )
-    print("  ✓ redirect on proof URI: single error, Location captured, www-fallback skipped")
+    print("  ✓ both primary + www 3xx: relay fails, category=redirect_disallowed, Location captured")
+
+
+def test_redirect_primary_recovered_via_www():
+    """When primary returns 3xx but www-fallback succeeds, the relay
+    VALIDATES (not a failure) and a validation_steps note records the
+    ignored primary error for diagnostic visibility."""
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    relay = {
+        'nickname': 'RecoveredRelay',
+        'fingerprint': 'I' * 40,
+        'family_ids': ['the_legitimate_public_family_id_value___'],
+        'contact': 'url:public.invalid proof:uri-familyid-ed25519 ciissversion:3',
+    }
+
+    # Primary returns 301 → www-fallback is tried → www returns 200 with
+    # the legitimate family id.
+    primary_3xx = MagicMock()
+    primary_3xx.status_code = 301
+    primary_3xx.headers = {'Location': 'https://www.public.invalid/.well-known/tor-relay/ed25519-family-id.txt'}
+    www_ok = MagicMock()
+    www_ok.status_code = 200
+    www_ok.headers = {}
+    www_ok.text = relay['family_ids'][0] + '\n'
+    # raise_for_status is a no-op for 200; we just need it not to throw.
+    www_ok.raise_for_status = MagicMock(return_value=None)
+
+    with patch.object(v.session, 'get', side_effect=[primary_3xx, www_ok]) as mock_get:
+        out = v.validate_relay(relay)
+
+    assert mock_get.call_count == 2
+    assert out['valid'] is True, out
+    # validation_steps should contain TWO entries: the ignored-primary note
+    # and the successful match.
+    steps = out.get('validation_steps') or []
+    note = next((s for s in steps if 'primary fetch failed' in s.get('step', '')), None)
+    assert note is not None, f"missing primary-error note in validation_steps: {steps}"
+    assert note['success'] is False
+    assert 'redirect_disallowed' in note['details'], note
+    print("  ✓ primary 3xx + www 200: relay validates, primary error recorded as ignored note")
 
 
 def main():
@@ -290,7 +324,8 @@ def main():
     test_is_safe_public_host_rejects_private_resolution()
     test_uri_validation_blocked_for_ip_literal()
     test_uri_validation_blocked_for_private_resolution()
-    test_redirect_disallowed()
+    test_redirect_both_primary_and_www_fail()
+    test_redirect_primary_recovered_via_www()
     print("\nAll mocked-input tests passed.")
     return 0
 

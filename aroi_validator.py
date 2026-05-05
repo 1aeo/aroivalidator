@@ -848,7 +848,12 @@ class ParallelAROIValidator:
     # primary and www-fallback fail with mixed reasons. More-actionable
     # categories (operator can do something specific) win over generic
     # transport errors.
-    _URI_PREFERRED_CATEGORIES = ('uri_file_missing',)
+    # Categories surfaced as the result error_category when both primary
+    # and www-fallback fail with mixed reasons. More-actionable categories
+    # (operator can do something specific) win over generic transport
+    # errors. uri_file_missing first (operator can publish the file);
+    # redirect_disallowed second (operator can remove the redirect).
+    _URI_PREFERRED_CATEGORIES = ('uri_file_missing', 'redirect_disallowed')
 
     def _validate_uri_fetch(self, relay, aroi, result, spec, url, domain, cache_key) -> Dict:
         """Fetch URI proof via HTTPS (with www-fallback) and dispatch to _finalize_match.
@@ -889,6 +894,22 @@ class ParallelAROIValidator:
             )
             if response is not None:
                 self._set_domain_result(cache_key, success=True, raw=response.text)
+                # If we recovered via the www-fallback after primary errored
+                # (e.g. operator redirects bare-domain → www but serves the
+                # proof only on www), record the ignored primary error in
+                # validation_steps for diagnostic visibility. The relay still
+                # validates; this is not a failure.
+                if _is_www and all_errors:
+                    primary_cat = all_categories[0] if all_categories else 'unknown'
+                    result['validation_steps'].append({
+                        'step': f"{label} primary fetch failed (ignored)",
+                        'success': False,
+                        'details': (
+                            f"primary URL returned {primary_cat}; "
+                            f"validated via www-fallback. Primary error: "
+                            f"{all_errors[0][:200]}"
+                        ),
+                    })
                 return self._finalize_match(
                     result, spec, response.text, relay, domain, cached=False
                 )
@@ -897,21 +918,25 @@ class ParallelAROIValidator:
 
             # After the primary, decide whether to try www-fallback.
             #
-            # Skip the fallback when:
+            # Skip the fallback only when:
             #  - primary failed with a connectivity error (the host is
             #    unreachable; www variant won't help if the parent is down)
-            #  - primary returned an HTTP redirect (CIISS-spec rejection
-            #    that applies equally to www; trying www just produces a
-            #    duplicate error message)
-            #  - the SSRF gate rejects the www host (different A records
-            #    pointing into private space).
+            #  - the SSRF gate rejects the www host (e.g. naked-host A
+            #    record is public but www variant resolves into private
+            #    space).
+            #
+            # We DO try the fallback for HTTP redirects (3xx). One bad
+            # primary doesn't mean the operator's setup is broken: many
+            # operators redirect bare-domain → www and serve the proof
+            # only on www. If the www-fallback fetch succeeds, the relay
+            # validates (with a note recording that the primary redirected,
+            # which we ignored). If both primary and www-fallback fail,
+            # the relay fails normally.
             if not _is_www and len(attempts) == 1:
                 is_connectivity = any(
                     p in error_msg.lower() for p in _CONNECTIVITY_ERROR_PATTERNS
                 )
-                if (not is_connectivity
-                        and error_category != 'redirect_disallowed'
-                        and not domain.startswith('www.')):
+                if not is_connectivity and not domain.startswith('www.'):
                     www_host = f"www.{domain}"
                     safe_www, _reason = is_safe_public_host(www_host)
                     if safe_www:

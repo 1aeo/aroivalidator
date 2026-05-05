@@ -148,9 +148,20 @@ point us at internal infrastructure. Three-layer mitigation:
    loopback / private (RFC1918, RFC4193) / link-local / multicast /
    reserved / unspecified range.
 3. **HTTP redirects are disabled** (`allow_redirects=False`). A 3xx
-   response on the proof URI is treated as a proof failure with
-   `error_category: redirect_disallowed`. CIISS spec also mandates
-   "MUST NOT redirect to another domain".
+   response is never followed by `requests` (`Location` could otherwise
+   point into private space). CIISS spec also mandates "MUST NOT
+   redirect to another domain" on the proof URI.
+
+   **Behavior on 3xx response:** A primary-URL 3xx is **not** an
+   automatic failure. The validator still tries the **www-fallback**
+   (`https://www.<domain>/.well-known/...`) — many operators legitimately
+   redirect bare-domain to www and serve the proof file only on www. If
+   the www-fallback succeeds, the relay validates and the primary's
+   redirect is recorded as an informational note in `validation_steps`
+   (not a failure). If **both** primary and www-fallback fail (any
+   combination of 3xx, 404, transport error), the relay fails with the
+   most actionable `error_category` (`uri_file_missing` > `redirect_disallowed`
+   > `transport_error`).
 
 Tests for these protections live in `tests/test_rollover_and_security.py`
 (`test_ip_safety_classification`, `test_is_safe_public_host_*`,
