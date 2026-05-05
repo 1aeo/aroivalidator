@@ -129,8 +129,10 @@ def main():
         forwarded_args += ['--ciiss-versions', args.ciiss_versions]
 
     if args.mode == 'batch':
-        subprocess.run([sys.executable, "app.py", "--mode", "batch", *forwarded_args])
-        return
+        # Propagate child exit code so cron / CI / aroivalidator-deploy can
+        # distinguish a batch failure from a successful run.
+        proc = subprocess.run([sys.executable, "app.py", "--mode", "batch", *forwarded_args])
+        sys.exit(proc.returncode)
 
     # interactive / viewer → Streamlit
     print(f"Starting AROI Validator - {args.mode.capitalize()} Mode")
@@ -147,7 +149,8 @@ def main():
     ]
 
     try:
-        subprocess.run(cmd)
+        proc = subprocess.run(cmd)
+        sys.exit(proc.returncode)
     except KeyboardInterrupt:
         print("\nShutting down...")
         sys.exit(0)

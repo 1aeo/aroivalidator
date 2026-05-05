@@ -133,6 +133,36 @@ Results saved to `validation_results/` as JSON:
 
 ## Security Notes
 
+### SSRF protection (Server-Side Request Forgery)
+
+Relay `ContactInfo url:` is operator-provided and untrusted. The validator
+fetches `https://<that-host>/.well-known/...` for v2 `uri-rsa` and v3
+`uri-familyid-ed25519` proofs, so a malicious operator could otherwise
+point us at internal infrastructure. Three-layer mitigation:
+
+1. **IP-literal hostnames are rejected outright.** A relay that publishes
+   `url:127.0.0.1` or `url:169.254.169.254` (cloud metadata IP) gets
+   `error_category: unsafe_target` before any network connect.
+2. **DNS-resolved addresses are checked.** The hostname is resolved
+   (A and AAAA) and rejected if any returned address is in a
+   loopback / private (RFC1918, RFC4193) / link-local / multicast /
+   reserved / unspecified range.
+3. **HTTP redirects are disabled** (`allow_redirects=False`). A 3xx
+   response on the proof URI is treated as a proof failure with
+   `error_category: redirect_disallowed`. CIISS spec also mandates
+   "MUST NOT redirect to another domain".
+
+Tests for these protections live in `tests/test_rollover_and_security.py`
+(`test_ip_safety_classification`, `test_is_safe_public_host_*`,
+`test_uri_validation_blocked_*`, `test_redirect_disallowed`). Run them with
+`pytest` or directly via `python3 tests/test_rollover_and_security.py`.
+
+There is a residual TOCTOU window between our pre-flight DNS check and
+`requests`' own resolution. For threat models that require eliminating
+this, a custom HTTPAdapter that pins the resolved IP would be needed
+(out of scope today; the current mitigation catches the entire realistic
+threat surface — a relay operator publishing a private/loopback URL).
+
 ### TLS/SSL Configuration
 
 The validator uses configurable TLS settings to balance security with compatibility:

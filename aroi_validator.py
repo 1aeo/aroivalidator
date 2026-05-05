@@ -8,6 +8,7 @@ CIISS spec: https://nusenu.github.io/ContactInfo-Information-Sharing-Specificati
                    (verifies operator's ed25519 family ID against relay.family_ids)
 """
 import concurrent.futures
+import ipaddress
 import json
 import logging
 import re
@@ -96,6 +97,112 @@ def _tokenize_proof(content: Any, kind: str) -> set:
         l.strip() for l in (content or '').splitlines()
         if l.strip() and not l.strip().startswith('#')
     }
+
+
+# ============================================================================
+# SSRF protection
+# ============================================================================
+# Relay ContactInfo `url:` is operator-provided and untrusted. v3 URI proofs
+# fetch https://<that-host>/.well-known/... — without protection, a malicious
+# operator could point us at loopback (127.0.0.1), link-local
+# (169.254.169.254 cloud metadata), or RFC1918 private addresses, or chain a
+# public host via an HTTP redirect to one of those. Two-layer mitigation:
+#   1. Reject IP-literal hostnames outright.
+#   2. Resolve the hostname (A + AAAA) and reject if any answer is in a
+#      private/loopback/link-local/reserved/multicast/unspecified range.
+#   3. Disable HTTP redirects entirely (the spec also says proof URIs MUST
+#      NOT redirect).
+# This still has a TOCTOU window between our resolve and requests' resolve,
+# but it catches the vast majority of real-world SSRF and meets the defensive
+# bar for a CI/hosted deployment of the validator.
+
+# Cache resolved-safe results per validator run so we don't double-resolve.
+_HOST_SAFETY_CACHE: Dict[str, Tuple[bool, str]] = {}
+_HOST_SAFETY_LOCK = threading.Lock()
+
+
+def _ip_is_safe(ip: str) -> bool:
+    """Return True if the IP literal is a routable public address."""
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    # Reject every non-public class explicitly so future address types
+    # default-deny rather than default-allow.
+    return not (
+        ip_obj.is_loopback
+        or ip_obj.is_private
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+    )
+
+
+def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
+    """Check whether hostname is safe to HTTPS-fetch.
+
+    Rejects IP-literal hostnames outright, then resolves A/AAAA and rejects
+    if any resolved address is in a private/loopback/link-local/reserved/
+    multicast/unspecified range. Result cached per validator run.
+
+    Returns:
+        (safe: bool, reason: str). reason is the rejection cause when
+        safe=False, or the resolved IP for diagnostic logging when safe=True.
+    """
+    if not hostname:
+        return False, "empty hostname"
+
+    with _HOST_SAFETY_LOCK:
+        if hostname in _HOST_SAFETY_CACHE:
+            return _HOST_SAFETY_CACHE[hostname]
+
+    # 1. Reject IP-literal hostnames. ContactInfo `url:` should be a domain,
+    #    not an IP. CIISS spec describes URLs / FQDNs.
+    try:
+        ipaddress.ip_address(hostname)
+        result = (False, "url is an IP literal, not a domain")
+        with _HOST_SAFETY_LOCK:
+            _HOST_SAFETY_CACHE[hostname] = result
+        return result
+    except ValueError:
+        pass  # Not an IP literal — good.
+
+    # 2. Resolve the hostname and check every returned address.
+    try:
+        infos = socket.getaddrinfo(
+            hostname, None,
+            type=socket.SOCK_STREAM,
+        )
+    except (socket.gaierror, OSError) as e:
+        # Couldn't resolve — let the actual fetch fail with a meaningful
+        # transport error. Don't cache, in case it's transient.
+        return True, f"unresolved (defer to fetch): {e}"
+
+    ips = {info[4][0] for info in infos}
+    if not ips:
+        result = (False, "no A/AAAA records resolved")
+        with _HOST_SAFETY_LOCK:
+            _HOST_SAFETY_CACHE[hostname] = result
+        return result
+
+    unsafe = [ip for ip in ips if not _ip_is_safe(ip)]
+    if unsafe:
+        result = (False, f"resolves to non-public address(es): {','.join(sorted(unsafe))}")
+        with _HOST_SAFETY_LOCK:
+            _HOST_SAFETY_CACHE[hostname] = result
+        return result
+
+    result = (True, ','.join(sorted(ips)))
+    with _HOST_SAFETY_LOCK:
+        _HOST_SAFETY_CACHE[hostname] = result
+    return result
+
+
+def _clear_host_safety_cache() -> None:
+    """Clear the host-safety cache. Called between validation runs."""
+    with _HOST_SAFETY_LOCK:
+        _HOST_SAFETY_CACHE.clear()
 
 
 def _looks_like_secret_key(content_lines: List[str]) -> bool:
@@ -187,6 +294,22 @@ CATEGORY_INFO: Dict[str, Dict[str, Optional[str]]] = {
                  "url:example.com"),
         'title': "ciissversion:3 relays with invalid url field",
         'action': "fix the url field in ContactInfo to be a valid domain",
+    },
+    'unsafe_target': {
+        'hint': ("The url field points at an IP literal or a hostname "
+                 "resolving to a private/loopback/link-local address. "
+                 "Set url to a publicly-routable domain "
+                 "(operator's public website)."),
+        'title': "relays with url pointing at a non-public IP/host (SSRF-blocked)",
+        'action': "set url to a publicly-routable domain",
+    },
+    'redirect_disallowed': {
+        'hint': ("The .well-known proof URI returned an HTTP redirect. "
+                 "CIISS spec requires the proof endpoint to NOT redirect. "
+                 "Serve the file directly at /.well-known/tor-relay/"
+                 "ed25519-family-id.txt without 3xx redirects."),
+        'title': "ciissversion:3 URI proofs returning HTTP redirects",
+        'action': "remove redirects from the .well-known/tor-relay/ path",
     },
     'secret_key_leaked': {
         'hint': ("SECURITY INCIDENT: the published content looks like "
@@ -455,10 +578,11 @@ class ParallelAROIValidator:
                 self._domain_conditions[cache_key].notify_all()
 
     def clear_domain_cache(self) -> None:
-        """Clear the domain cache (call before each validation run)."""
+        """Clear domain cache and host-safety cache (call before each run)."""
         with self._domain_cache_lock:
             self._domain_cache.clear()
             self._domain_conditions.clear()
+        _clear_host_safety_cache()
 
     # ------------------------------------------------------------------
     # Onionoo
@@ -727,21 +851,39 @@ class ParallelAROIValidator:
     _URI_PREFERRED_CATEGORIES = ('uri_file_missing',)
 
     def _validate_uri_fetch(self, relay, aroi, result, spec, url, domain, cache_key) -> Dict:
-        """Fetch URI proof via HTTPS (with www-fallback) and dispatch to _finalize_match."""
+        """Fetch URI proof via HTTPS (with www-fallback) and dispatch to _finalize_match.
+
+        SSRF protection: every target host (primary and www-fallback) is
+        passed through is_safe_public_host BEFORE any HTTPS connection,
+        rejecting IP literals and hostnames resolving to
+        private/loopback/link-local addresses.
+        """
         label = spec['label']
         path = spec['locator'](relay, domain)
+
+        # SSRF gate on primary host BEFORE any network connect.
+        safe, reason = is_safe_public_host(domain)
+        if not safe:
+            msg = f"{label}: {reason} (SSRF-blocked: {domain})"
+            self._set_domain_result(
+                cache_key, success=False,
+                error_msg=msg, error_category='unsafe_target',
+            )
+            result['error'] = msg
+            result['error_category'] = 'unsafe_target'
+            return result
+
         # Force HTTPS for .well-known fetches regardless of operator's url:
         # scheme. CIISS spec requires HTTPS. Use parsed.hostname (port-stripped,
         # lowercase) to avoid `:8443` appearing in the fetch URL.
-        attempts = [(f"https://{domain}{path}", False)]
-        # www fallback only for HTTP-level errors, not connectivity errors.
-        # We can't decide that until we've tried primary, so we attempt it
-        # below conditionally.
+        attempts: List[Tuple[str, str, bool]] = [
+            (f"https://{domain}{path}", domain, False),
+        ]
 
         all_errors: List[str] = []
         all_categories: List[Optional[str]] = []
 
-        for fetch_url, _is_www in attempts:
+        for fetch_url, fetch_host, _is_www in attempts:
             response, error_msg, error_category, _ = self._fetch_with_retry(
                 fetch_url, error_label=label
             )
@@ -759,7 +901,12 @@ class ParallelAROIValidator:
                     p in error_msg.lower() for p in _CONNECTIVITY_ERROR_PATTERNS
                 )
                 if not is_connectivity and not domain.startswith('www.'):
-                    attempts.append((f"https://www.{domain}{path}", True))
+                    www_host = f"www.{domain}"
+                    # SSRF gate the www variant too — operators can have
+                    # divergent A records for naked vs www.
+                    safe_www, _reason = is_safe_public_host(www_host)
+                    if safe_www:
+                        attempts.append((f"https://{www_host}{path}", www_host, True))
 
         # All variants failed. Pick the most-actionable category across all
         # attempts (e.g. uri_file_missing on either primary or www trumps a
@@ -926,11 +1073,25 @@ class ParallelAROIValidator:
 
         for attempt in range(1, max_attempts + 1):
             try:
+                # SSRF defense: disable redirects entirely. CIISS spec also
+                # mandates the proof URI MUST NOT redirect to another domain;
+                # this enforces that. A 3xx response is treated as a proof
+                # failure (see status==3xx branch below).
                 response = self.session.get(
                     url,
                     timeout=DEFAULT_TIMEOUT_SECONDS,
                     verify=self.verify_certificates,
+                    allow_redirects=False,
                 )
+                if 300 <= response.status_code < 400:
+                    domain = urlparse(url).hostname or ''
+                    last_error = (
+                        f"{error_label}: HTTP redirect ({response.status_code}) "
+                        f"for {domain} at URL: {url} — CIISS spec disallows "
+                        f"redirects on proof URI"
+                    )
+                    last_category = 'redirect_disallowed'
+                    break
                 response.raise_for_status()
                 return response, "", None, attempt
 

@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
-"""Smoke tests for ciissversion:3 edge cases that don't require network:
+"""ciissversion:3 mocked-input tests (no network required).
 
-  - Rollover simulation: two relays sharing the same url but with disjoint
-    family_ids. Mock dns.resolver.resolve to return one TXT and verify:
-      1. dns.resolver.resolve is called exactly ONCE (shared cache reuses
-         the response).
-      2. spec['matches'] re-runs per relay using cached content (relay A
-         validates because its family_id is in the TXT, relay B does not).
-      3. _set_domain_result is called exactly ONCE.
+Discoverable by pytest (`pytest tests/test_rollover_and_security.py`) and
+also runnable as a standalone script (`python3 tests/test_rollover_and_security.py`).
 
-  - Secret-key leak: synthetic TXT containing simulated .secret_family_key
-    content. Verify:
-      1. result['error_category'] == 'secret_key_leaked'.
-      2. SECURITY-prefixed error.
-      3. valid is False (overrides any potential match).
-
-Exit 0 on success, non-zero on any failure.
+Covers:
+  - Rollover simulation (shared DNS cache, per-relay match)
+  - Secret-key-leak detection (DNS and URI paths)
+  - Case-mismatch diagnostic
+  - SSRF protections (IP literals, private/loopback ranges, redirects)
 """
 import sys
 import os.path
@@ -23,7 +16,12 @@ from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from aroi_validator import ParallelAROIValidator
+from aroi_validator import (
+    ParallelAROIValidator,
+    is_safe_public_host,
+    _ip_is_safe,
+    _clear_host_safety_cache,
+)
 
 
 def test_rollover():
@@ -146,13 +144,142 @@ def test_case_mismatch_diagnostic():
     print("  ✓ case-mismatch diagnostic: case-only mismatch tagged in error message")
 
 
+def test_ip_safety_classification():
+    """_ip_is_safe must reject every non-public class outright."""
+    UNSAFE = [
+        '127.0.0.1',         # loopback
+        '127.255.255.254',
+        '10.0.0.1',          # RFC1918
+        '10.255.255.255',
+        '172.16.0.1',        # RFC1918
+        '172.31.255.254',
+        '192.168.1.1',       # RFC1918
+        '169.254.169.254',   # link-local / cloud metadata (AWS/GCP/Azure)
+        '0.0.0.0',           # unspecified
+        '224.0.0.1',         # multicast
+        '255.255.255.255',   # reserved/broadcast
+        '::1',               # IPv6 loopback
+        'fe80::1',           # IPv6 link-local
+        'fc00::1',           # IPv6 unique local (private)
+        'fd00::1',           # IPv6 unique local (private)
+        'ff02::1',           # IPv6 multicast
+        '::',                # IPv6 unspecified
+    ]
+    for ip in UNSAFE:
+        assert not _ip_is_safe(ip), f"{ip!r} should be classified unsafe"
+    SAFE = ['8.8.8.8', '1.1.1.1', '93.184.216.34', '2606:2800:220:1::6']
+    for ip in SAFE:
+        assert _ip_is_safe(ip), f"{ip!r} should be classified safe"
+    print("  ✓ _ip_is_safe correctly classifies private/loopback/link-local/multicast/reserved")
+
+
+def test_is_safe_public_host_rejects_ip_literals():
+    """Hostname check must reject IP-literal hostnames outright (no DNS)."""
+    _clear_host_safety_cache()
+    for ip in ('127.0.0.1', '169.254.169.254', '10.0.0.1', '::1', 'fe80::1'):
+        safe, reason = is_safe_public_host(ip)
+        assert not safe, f"{ip!r} should be rejected; got {(safe, reason)}"
+        assert 'IP literal' in reason or 'literal' in reason, reason
+    print("  ✓ is_safe_public_host rejects IP-literal hostnames outright")
+
+
+def test_is_safe_public_host_rejects_private_resolution():
+    """Hostname resolving to a private/loopback address must be rejected."""
+    _clear_host_safety_cache()
+    # localhost resolves to 127.0.0.1 / ::1 on every platform
+    safe, reason = is_safe_public_host('localhost')
+    assert not safe, f"localhost should resolve to private/loopback: ({safe}, {reason})"
+    assert 'non-public' in reason, reason
+    print("  ✓ is_safe_public_host rejects hostnames resolving to private/loopback")
+
+
+def test_uri_validation_blocked_for_ip_literal():
+    """End-to-end: a relay with url:127.0.0.1 must be SSRF-blocked before any HTTP."""
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    relay = {
+        'nickname': 'AttackerRelay',
+        'fingerprint': 'F' * 40,
+        'family_ids': ['fid'],
+        'contact': 'url:127.0.0.1 proof:uri-familyid-ed25519 ciissversion:3',
+    }
+    # If the SSRF gate works, _fetch_with_retry must NEVER be invoked.
+    with patch.object(v, '_fetch_with_retry') as mock_fetch:
+        out = v.validate_relay(relay)
+    assert mock_fetch.call_count == 0, (
+        f"SSRF gate failed — _fetch_with_retry was invoked {mock_fetch.call_count} time(s)"
+    )
+    assert out['valid'] is False
+    assert out['error_category'] == 'unsafe_target', out
+    assert 'SSRF-blocked' in out['error'], out
+    print("  ✓ SSRF gate: url:127.0.0.1 blocks fetch entirely; error_category=unsafe_target")
+
+
+def test_uri_validation_blocked_for_private_resolution():
+    """End-to-end: a relay with url:localhost (resolves private) must be blocked."""
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    relay = {
+        'nickname': 'AttackerRelay2',
+        'fingerprint': 'G' * 40,
+        'family_ids': ['fid'],
+        'contact': 'url:localhost proof:uri-familyid-ed25519 ciissversion:3',
+    }
+    # localhost might fail _extract_domain (no '.'); pre-validate that.
+    out = v.validate_relay(relay)
+    # Either SSRF-blocked OR rejected as invalid_url (no '.' in 'localhost').
+    # Both outcomes prevent SSRF; assert one of them.
+    assert out['valid'] is False, out
+    assert out['error_category'] in ('unsafe_target', 'invalid_url'), out
+    print(f"  ✓ url:localhost rejected with error_category={out['error_category']}")
+
+
+def test_redirect_disallowed():
+    """An HTTP redirect on the proof URI must NOT be followed (CIISS spec) and
+    must produce a redirect_disallowed error."""
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    relay = {
+        'nickname': 'RedirectRelay',
+        'fingerprint': 'H' * 40,
+        'family_ids': ['fid'],
+        'contact': 'url:public.invalid proof:uri-familyid-ed25519 ciissversion:3',
+    }
+    # Mock session.get to return a 301
+    fake_response = MagicMock()
+    fake_response.status_code = 301
+    fake_response.headers = {'Location': 'https://attacker.invalid/'}
+
+    # Patch the session at module level: a 301 response shouldn't be followed
+    with patch.object(v.session, 'get', return_value=fake_response) as mock_get:
+        out = v.validate_relay(relay)
+
+    # session.get must have been called; allow_redirects must be False.
+    assert mock_get.call_count >= 1
+    for call in mock_get.call_args_list:
+        kwargs = call.kwargs
+        assert kwargs.get('allow_redirects') is False, (
+            f"allow_redirects must be False for SSRF defense; got {kwargs}"
+        )
+    assert out['valid'] is False
+    assert out['error_category'] == 'redirect_disallowed', out
+    assert '301' in out['error'] or 'redirect' in out['error'].lower(), out
+    print("  ✓ redirect on proof URI: not followed, error_category=redirect_disallowed")
+
+
 def main():
-    print("Running ciissversion:3 rollover and security smoke tests...")
+    print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
     test_secret_key_leak_dns()
     test_secret_key_leak_uri()
     test_case_mismatch_diagnostic()
-    print("\nAll rollover/security smoke tests passed.")
+    test_ip_safety_classification()
+    test_is_safe_public_host_rejects_ip_literals()
+    test_is_safe_public_host_rejects_private_resolution()
+    test_uri_validation_blocked_for_ip_literal()
+    test_uri_validation_blocked_for_private_resolution()
+    test_redirect_disallowed()
+    print("\nAll mocked-input tests passed.")
     return 0
 
 
