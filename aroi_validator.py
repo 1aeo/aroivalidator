@@ -625,6 +625,12 @@ class ParallelAROIValidator:
         result['proof_type'] = aroi['proof']
 
         url = aroi.get('url')
+        # Distinguish "url missing entirely" from "url present but unparseable":
+        # missing-url uses the legacy v2 wording ("Missing AROI field: url, ...")
+        # which downstream consumers and the README error catalogue depend on.
+        if not url:
+            result['error'] = f"Missing AROI field: url, required for {label} proof"
+            return result
         domain = self._extract_domain(url)
         if not domain:
             result['error'] = f"{label}: Invalid domain in url field: {url}"
