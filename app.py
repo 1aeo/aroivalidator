@@ -116,8 +116,17 @@ def _resolve_ciissversions_from_args(argv):
     # Separated form: --ciiss-versions value (only if combined wasn't found)
     if flag_value is None and "--ciiss-versions" in argv:
         idx = argv.index("--ciiss-versions") + 1
-        if idx < len(argv):
-            flag_value = argv[idx]
+        if idx >= len(argv):
+            # Flag present with no value — fail loudly rather than silently
+            # falling back to env / defaults. Operators reading the cron log
+            # would otherwise wonder why their flag was ignored.
+            print(
+                "error: --ciiss-versions requires a value (e.g. --ciiss-versions 2,3 "
+                "or --ciiss-versions=2,3)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        flag_value = argv[idx]
 
     env_value = os.environ.get('CIISS_VERSIONS')
 
@@ -495,11 +504,26 @@ def main():
     """Main entry point with mode selection"""
     mode = "interactive"
 
-    # Check for command line mode
-    if "--mode" in sys.argv:
-        mode_index = sys.argv.index("--mode") + 1
-        if mode_index < len(sys.argv):
-            mode = sys.argv[mode_index]
+    # Accept both --mode <value> and --mode=<value>. Combined form match wins.
+    combined = next(
+        (t for t in sys.argv if t.startswith("--mode=")),
+        None,
+    )
+    if combined is not None:
+        mode = combined.split("=", 1)[1]
+    elif "--mode" in sys.argv:
+        idx = sys.argv.index("--mode") + 1
+        if idx >= len(sys.argv):
+            # Flag present with no value — fail loudly rather than silently
+            # defaulting to interactive. (Same defensive pattern as
+            # _resolve_ciissversions_from_args.)
+            print(
+                "error: --mode requires a value "
+                "(interactive | batch | viewer | insights)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        mode = sys.argv[idx]
 
     # Resolve supported ciissversions from --ciiss-versions flag or env var.
     supported_ciissversions = _resolve_ciissversions_from_args(sys.argv)
