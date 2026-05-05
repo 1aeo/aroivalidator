@@ -97,7 +97,9 @@ BATCH_LIMIT=500 MAX_WORKERS=20 python aroi_cli.py batch --ciiss-versions 2,3
 1. Fetch relay data from Onionoo API
 2. **Filter out stale relays** (offline > 14 days) - workaround for Onionoo API bug
 3. Extract AROI proof fields from relay contact info
-4. Validate proofs via DNS TXT records or URI-based RSA
+4. Validate proofs via DNS TXT or URI-based RSA (CIISS v2: `dns-rsa`,
+   `uri-rsa`), and DNS TXT or URI-based ed25519 family-ID
+   (CIISS v3: `dns-familyid-ed25519`, `uri-familyid-ed25519`)
 5. Calculate success rates by proof type
 6. Save results as timestamped JSON
 
@@ -407,12 +409,21 @@ publish in DNS/HTTP.
 #### Step 2 — Configure every relay to use the happy-family key
 
 On each relay:
-1. Copy `myfamily.secret_family_key` to Tor's key directory. Match
-   permissions to other Tor key files (owner-read-only, same user as Tor).
-2. Configure the happy-family directive in `torrc` to point at that key
-   file (consult the current Tor manual for the exact directive name).
-3. Do NOT set a manual `MyFamily` list — the happy-family key replaces it.
-4. Restart Tor (`systemctl restart tor@default` or equivalent).
+1. Copy `myfamily.secret_family_key` to Tor's `KeyDir` (default:
+   `keys/` subdirectory of `DataDir`). Match permissions to other Tor key
+   files (owner-read-only, same user as Tor).
+2. Add a `FamilyId` line to the relay's `torrc` (the value is printed by
+   `tor --keygen-family`). See the Tor Project's
+   [FamilyID setup guide](https://community.torproject.org/relay/setup/post-install/family-ids/)
+   for the authoritative walkthrough.
+3. Until all Tor clients support Happy Families, keep the legacy
+   `MyFamily <fp1>,<fp2>,...` line in torrc as well (per the upstream
+   guide). Once `family-ids` appears in your relay's microdescriptor you
+   can drop `MyFamily` whenever the Tor Project announces the cutover.
+4. Restart Tor (`systemctl restart tor@default` or equivalent), then
+   verify by running:
+   `curl "https://onionoo.torproject.org/details?lookup=<fingerprint>&fields=family_ids" | jq`
+   You should see your public family ID in the `family_ids` array.
 
 #### Step 3 — Wait for Onionoo to pick up `family_ids`
 
@@ -463,7 +474,7 @@ curl -v https://<your-domain>/.well-known/tor-relay/ed25519-family-id.txt
 
 Set the relay's torrc `ContactInfo` line to include at minimum:
 
-```
+```text
 # DNS path
 <your normal contact text> url:<your-domain> proof:dns-familyid-ed25519 ciissversion:3
 

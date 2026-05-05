@@ -404,6 +404,26 @@ ALL_KNOWN_CIISSVERSIONS = tuple(sorted({v for (v, _) in PROOF_SPECS}))
 SUPPORTED_CIISSVERSIONS_DEFAULT = ('2', '3')
 
 
+def parse_aroi_fields(contact: str) -> Dict[str, str]:
+    """Public helper: parse recognized AROI fields from a ContactInfo string.
+
+    Returns a dict of {field_name: first_value_found} for any of the
+    recognized fields (ciissversion, proof, url, email). Spec rule: keys
+    MUST appear only once; if duplicated, only the first occurrence is
+    considered.
+
+    Used by external scripts (e.g. tests/validate_known_v3_operators.py)
+    that need to group relays by their declared AROI fields without
+    importing the validator's private internals.
+    """
+    fields: Dict[str, str] = {}
+    for field, pattern in _AROI_PATTERNS.items():
+        match = pattern.search(contact)
+        if match:
+            fields[field] = match.group(1)
+    return fields
+
+
 def parse_ciissversions_flag(s: str) -> Tuple[str, ...]:
     """Parse a comma-separated --ciiss-versions value into a validated tuple.
 
@@ -734,13 +754,7 @@ class ParallelAROIValidator:
         (kept for any callers that read it); validate_relay does its own
         ciissversion-aware required-field checks.
         """
-        fields: Dict[str, str] = {}
-        for field, pattern in _AROI_PATTERNS.items():
-            match = pattern.search(contact)
-            if match:
-                fields[field] = match.group(1)
-        # Spec: keys MUST appear only once; if duplicated only the first is
-        # considered (re.search returns the first match). We honor that.
+        fields = parse_aroi_fields(contact)
         missing = [f for f in ('ciissversion', 'proof') if f not in fields]
         return fields, missing
 

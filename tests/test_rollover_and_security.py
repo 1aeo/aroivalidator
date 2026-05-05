@@ -10,6 +10,7 @@ Covers:
   - Case-mismatch diagnostic
   - SSRF protections (IP literals, private/loopback ranges, redirects)
 """
+import socket
 import sys
 import os.path
 from unittest.mock import patch, MagicMock
@@ -37,13 +38,13 @@ def test_rollover():
         'nickname': 'RelayA',
         'fingerprint': 'A' * 40,
         'family_ids': [family_id_a],
-        'contact': f'url:example.invalid proof:dns-familyid-ed25519 ciissversion:3',
+        'contact': 'url:example.invalid proof:dns-familyid-ed25519 ciissversion:3',
     }
     relay_b = {
         'nickname': 'RelayB',
         'fingerprint': 'B' * 40,
         'family_ids': [family_id_b],
-        'contact': f'url:example.invalid proof:dns-familyid-ed25519 ciissversion:3',
+        'contact': 'url:example.invalid proof:dns-familyid-ed25519 ciissversion:3',
     }
 
     # Mock the DNS resolver: every call returns one rdata whose .strings
@@ -196,18 +197,25 @@ def test_is_safe_public_host_rejects_ip_literals():
     for ip in ('127.0.0.1', '169.254.169.254', '10.0.0.1', '::1', 'fe80::1'):
         safe, reason = is_safe_public_host(ip)
         assert not safe, f"{ip!r} should be rejected; got {(safe, reason)}"
-        assert 'IP literal' in reason or 'literal' in reason, reason
+        assert 'IP literal' in reason, reason
     print("  ✓ is_safe_public_host rejects IP-literal hostnames outright")
 
 
 def test_is_safe_public_host_rejects_private_resolution():
-    """Hostname resolving to a private/loopback address must be rejected."""
+    """Hostname resolving to a private/loopback address must be rejected.
+    Hermetic: socket.getaddrinfo is mocked so the test does no real DNS."""
     _clear_host_safety_cache()
-    # localhost resolves to 127.0.0.1 / ::1 on every platform
-    safe, reason = is_safe_public_host('localhost')
-    assert not safe, f"localhost should resolve to private/loopback: ({safe}, {reason})"
+    # Synthetic getaddrinfo output: IPv4 loopback + IPv6 loopback.
+    # Format matches socket.getaddrinfo: (family, type, proto, canonname, sockaddr).
+    fake_infos = [
+        (socket.AF_INET, socket.SOCK_STREAM, 0, '', ('127.0.0.1', 0)),
+        (socket.AF_INET6, socket.SOCK_STREAM, 0, '', ('::1', 0, 0, 0)),
+    ]
+    with patch('aroi_validator.socket.getaddrinfo', return_value=fake_infos):
+        safe, reason = is_safe_public_host('mocked-loopback.invalid')
+    assert not safe, f"mocked loopback resolution should be rejected: ({safe}, {reason})"
     assert 'non-public' in reason, reason
-    print("  ✓ is_safe_public_host rejects hostnames resolving to private/loopback")
+    print("  ✓ is_safe_public_host rejects hostnames resolving to private/loopback (mocked DNS)")
 
 
 def test_uri_validation_blocked_for_ip_literal():

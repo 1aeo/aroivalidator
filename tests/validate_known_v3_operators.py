@@ -11,6 +11,7 @@ that ciissversion:3 support still works against real-world deployments.
 
 Exit code 0 on full success, non-zero if any operator fails to validate.
 """
+import json
 import sys
 from collections import defaultdict
 
@@ -20,35 +21,52 @@ import requests
 import os.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from aroi_validator import ParallelAROIValidator, _AROI_PATTERNS
+from aroi_validator import ParallelAROIValidator, parse_aroi_fields
 
 
 def main() -> int:
     print("Fetching ciissversion:3 relays from Onionoo...")
-    resp = requests.get(
-        'https://onionoo.torproject.org/details',
-        params={
-            'type': 'relay',
-            'contact': 'ciissversion:3',
-            'fields': 'nickname,fingerprint,contact,running,last_seen,family_ids',
-        },
-        timeout=30,
-    ).json()
+    try:
+        http_resp = requests.get(
+            'https://onionoo.torproject.org/details',
+            params={
+                'type': 'relay',
+                'contact': 'ciissversion:3',
+                'fields': 'nickname,fingerprint,contact,running,last_seen,family_ids',
+            },
+            timeout=30,
+        )
+        http_resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"error: Onionoo HTTP request failed: {e}", file=sys.stderr)
+        return 2
+    try:
+        resp = http_resp.json()
+    except (ValueError, json.JSONDecodeError) as e:
+        body_preview = (http_resp.text or '')[:200]
+        print(
+            f"error: Onionoo returned non-JSON body "
+            f"(status={http_resp.status_code}): {e}; "
+            f"first 200 chars: {body_preview!r}",
+            file=sys.stderr,
+        )
+        return 2
+
     relays = resp.get('relays', [])
     print(f"  → {len(relays)} relays returned")
 
     # Group by (url, proof) to identify distinct operators
     groups: dict = defaultdict(list)
     for r in relays:
-        contact = r.get('contact', '') or ''
-        url_m = _AROI_PATTERNS['url'].search(contact)
-        proof_m = _AROI_PATTERNS['proof'].search(contact)
-        ver_m = _AROI_PATTERNS['ciissversion'].search(contact)
-        if not (url_m and proof_m and ver_m and ver_m.group(1) == '3'):
+        fields = parse_aroi_fields(r.get('contact', '') or '')
+        url = fields.get('url')
+        proof = fields.get('proof')
+        version = fields.get('ciissversion')
+        if not (url and proof and version == '3'):
             continue
-        if proof_m.group(1) not in ('dns-familyid-ed25519', 'uri-familyid-ed25519'):
+        if proof not in ('dns-familyid-ed25519', 'uri-familyid-ed25519'):
             continue
-        groups[(url_m.group(1), proof_m.group(1))].append(r)
+        groups[(url, proof)].append(r)
 
     print(f"  → {len(groups)} distinct (url, proof) ciissversion:3 operator groups\n")
 

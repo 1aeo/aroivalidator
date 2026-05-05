@@ -19,9 +19,14 @@ Environment (batch mode):
   MAX_WORKERS       Number of worker threads (default: 10)
   CIISS_VERSIONS    Fallback for --ciiss-versions when flag absent.
 """
+import os.path
 import sys
 import subprocess
 import argparse
+
+
+# Resolve app.py relative to this script so the CLI works regardless of cwd.
+_APP_PY = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.py")
 
 
 def _build_parser():
@@ -115,6 +120,15 @@ def main():
     parser = _build_parser()
     args = parser.parse_args()
 
+    # Reject stray positional: insights_file is only valid in insights mode.
+    # Without this guard, `python aroi_cli.py batch some/path.json` would
+    # silently set insights_file and ignore it for batch.
+    if args.insights_file is not None and args.mode != 'insights':
+        parser.error(
+            f"unexpected positional argument {args.insights_file!r} "
+            f"for mode={args.mode!r} (only 'insights' accepts a file path)"
+        )
+
     if args.mode == 'insights':
         sys.exit(_run_insights(args.insights_file))
 
@@ -131,7 +145,7 @@ def main():
     if args.mode == 'batch':
         # Propagate child exit code so cron / CI / aroivalidator-deploy can
         # distinguish a batch failure from a successful run.
-        proc = subprocess.run([sys.executable, "app.py", "--mode", "batch", *forwarded_args])
+        proc = subprocess.run([sys.executable, _APP_PY, "--mode", "batch", *forwarded_args])
         sys.exit(proc.returncode)
 
     # interactive / viewer → Streamlit
@@ -141,7 +155,7 @@ def main():
 
     cmd = [
         sys.executable, "-m", "streamlit", "run",
-        "app.py",
+        _APP_PY,
         "--server.port", "5000",
         "--server.address", "0.0.0.0",
         "--server.headless", "true",

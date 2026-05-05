@@ -104,10 +104,17 @@ def _resolve_ciissversions_from_args(argv):
     """Resolve supported_ciissversions tuple with precedence:
     --ciiss-versions flag > CIISS_VERSIONS env var > SUPPORTED_CIISSVERSIONS_DEFAULT.
 
-    Returns a validated tuple of version strings.
+    Accepts both separated (`--ciiss-versions 2,3`) and combined
+    (`--ciiss-versions=2,3`) flag forms. Returns a validated tuple.
     """
     flag_value = None
-    if "--ciiss-versions" in argv:
+    # Combined form: --ciiss-versions=value (first match wins)
+    for token in argv:
+        if token.startswith("--ciiss-versions="):
+            flag_value = token.split("=", 1)[1]
+            break
+    # Separated form: --ciiss-versions value (only if combined wasn't found)
+    if flag_value is None and "--ciiss-versions" in argv:
         idx = argv.index("--ciiss-versions") + 1
         if idx < len(argv):
             flag_value = argv[idx]
@@ -278,7 +285,7 @@ def interactive_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
             help="Limit the number of relays to validate (0 = validate all)"
         )
 
-        st.session_state.supported_ciissversions = st.multiselect(
+        _selected = st.multiselect(
             "Validate ciissversion",
             options=list(ALL_KNOWN_CIISSVERSIONS),
             default=list(st.session_state.get(
@@ -288,6 +295,15 @@ def interactive_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
             help="Uncheck a ciissversion to skip relays that declare it. "
                  "Default seeded from --ciiss-versions CLI flag.",
         )
+        if not _selected:
+            # An empty selection would make every relay 'unsupported'. Warn
+            # and revert to the default set so validation still runs.
+            st.warning(
+                "Empty ciissversion selection is not allowed. "
+                "Reverting to defaults."
+            )
+            _selected = list(SUPPORTED_CIISSVERSIONS_DEFAULT)
+        st.session_state.supported_ciissversions = _selected
 
         st.divider()
         
