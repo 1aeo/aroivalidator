@@ -73,6 +73,31 @@ def _norm_family_ids(relay: Dict[str, Any]) -> set:
     return {s.strip() for s in (relay.get('family_ids') or []) if s and s.strip()}
 
 
+def _tokenize_proof(content: Any, kind: str) -> set:
+    """Parse fetched proof content into a comparable token set.
+
+    Single source of truth used by:
+      - PROOF_SPECS[*]['matches'] callbacks
+      - _finalize_match content-mismatch error formatting
+      - _case_mismatch_only diagnostic
+
+    Args:
+        content: list[str] for DNS (TXT records); str for URI (response.text).
+        kind: 'dns' or 'uri'.
+
+    Returns:
+        Set of stripped tokens. Comments (lines starting with '#') skipped for
+        URI content. Case preserved — callers handle case-(in)sensitive comparison.
+    """
+    if kind == 'dns':
+        return {r.strip() for r in (content or []) if r and r.strip()}
+    # 'uri': response.text → split lines, skip blanks and comments
+    return {
+        l.strip() for l in (content or '').splitlines()
+        if l.strip() and not l.strip().startswith('#')
+    }
+
+
 def _looks_like_secret_key(content_lines: List[str]) -> bool:
     """Detect whether published proof content appears to contain .secret_family_key.
 
@@ -210,7 +235,8 @@ PROOF_SPECS: Dict[Tuple[str, str], Dict[str, Any]] = {
         'locator': lambda relay, domain: f"{relay['fingerprint'].lower()}.{domain}",
         'shared_proof': False,  # per-relay subdomain — cannot reuse success
         'expected_desc': "'we-run-this-tor-relay'",
-        # content is List[str] of TXT records; substring match
+        # v2 dns-rsa is special: substring search across raw records, not a
+        # tokenized set match (proof is literal text, not a per-token value).
         'matches': lambda content, relay: any(
             'we-run-this-tor-relay' in r.lower() for r in content),
     },
@@ -219,22 +245,19 @@ PROOF_SPECS: Dict[Tuple[str, str], Dict[str, Any]] = {
         'locator': lambda relay, domain: '/.well-known/tor-relay/rsa-fingerprint.txt',
         'shared_proof': True,  # one file lists all relays
         'expected_desc': 'relay RSA fingerprint',
-        # content is str (response.text); RSA fingerprints are case-insensitive hex
+        # RSA fingerprints are case-insensitive hex
         'matches': lambda content, relay: relay['fingerprint'].upper() in {
-            l.strip().upper() for l in content.splitlines()
-            if l.strip() and not l.strip().startswith('#')
+            t.upper() for t in _tokenize_proof(content, 'uri')
         },
     },
     ('3', PROOF_TYPE_DNS_FAMILYID_ED25519): {
         'kind': 'dns', 'label': 'DNS-FamilyID',
-        # v3 DNS query is shared across the family
         'locator': lambda relay, domain: f"we-run-this-tor-ed25519-family-id.{domain}",
         'shared_proof': True,
         'expected_desc': 'relay family_ids (43-char ed25519)',
-        # content is List[str]; case-sensitive set intersection
+        # Case-sensitive intersection (spec: 43-char case-sensitive)
         'matches': lambda content, relay: bool(
-            {r.strip() for r in content if r.strip()}
-            & _norm_family_ids(relay)),
+            _tokenize_proof(content, 'dns') & _norm_family_ids(relay)),
     },
     ('3', PROOF_TYPE_URI_FAMILYID_ED25519): {
         'kind': 'uri', 'label': 'URI-FamilyID',
@@ -242,9 +265,7 @@ PROOF_SPECS: Dict[Tuple[str, str], Dict[str, Any]] = {
         'shared_proof': True,
         'expected_desc': 'relay family_ids (43-char ed25519)',
         'matches': lambda content, relay: bool(
-            {l.strip() for l in content.splitlines()
-             if l.strip() and not l.strip().startswith('#')}
-            & _norm_family_ids(relay)),
+            _tokenize_proof(content, 'uri') & _norm_family_ids(relay)),
     },
 }
 
@@ -481,9 +502,14 @@ class ParallelAROIValidator:
     # Validation entry point — single dispatcher
     # ------------------------------------------------------------------
 
-    def validate_relay(self, relay: Dict[str, Any]) -> Dict[str, Any]:
-        """Validate a single relay's AROI proof. Dispatches by ciissversion + proof type."""
-        result = {
+    @staticmethod
+    def _make_result_skeleton(relay: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a result dict with the canonical seven base keys.
+
+        Used by both the normal validate_relay path and validate_parallel's
+        exception handler so downstream consumers always see the same shape.
+        """
+        return {
             'nickname': relay.get('nickname', 'Unknown'),
             'fingerprint': relay.get('fingerprint', ''),
             'valid': False,
@@ -492,6 +518,10 @@ class ParallelAROIValidator:
             'validation_steps': [],
             'error': None,
         }
+
+    def validate_relay(self, relay: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate a single relay's AROI proof. Dispatches by ciissversion + proof type."""
+        result = self._make_result_skeleton(relay)
 
         contact = relay.get('contact', '')
         if not contact:
@@ -670,6 +700,12 @@ class ParallelAROIValidator:
             result['error_category'] = 'transport_error'
             return result
 
+    # Categories we'd rather surface than transport_error when both
+    # primary and www-fallback fail with mixed reasons. More-actionable
+    # categories (operator can do something specific) win over generic
+    # transport errors.
+    _URI_PREFERRED_CATEGORIES = ('uri_file_missing',)
+
     def _validate_uri_fetch(self, relay, aroi, result, spec, url, domain, cache_key) -> Dict:
         """Fetch URI proof via HTTPS (with www-fallback) and dispatch to _finalize_match."""
         label = spec['label']
@@ -677,39 +713,50 @@ class ParallelAROIValidator:
         # Force HTTPS for .well-known fetches regardless of operator's url:
         # scheme. CIISS spec requires HTTPS. Use parsed.hostname (port-stripped,
         # lowercase) to avoid `:8443` appearing in the fetch URL.
-        primary_url = f"https://{domain}{path}"
-
-        response, error_msg, error_category, attempts = self._fetch_with_retry(
-            primary_url, error_label=label
-        )
-        if response is not None:
-            self._set_domain_result(cache_key, success=True, raw=response.text)
-            return self._finalize_match(
-                result, spec, response.text, relay, domain, cached=False
-            )
-
-        all_errors = [error_msg]
+        attempts = [(f"https://{domain}{path}", False)]
         # www fallback only for HTTP-level errors, not connectivity errors.
-        is_connectivity = any(p in error_msg.lower() for p in _CONNECTIVITY_ERROR_PATTERNS)
-        if not is_connectivity and not domain.startswith('www.'):
-            www_url = f"https://www.{domain}{path}"
-            response2, err2, cat2, _ = self._fetch_with_retry(www_url, error_label=label)
-            if response2 is not None:
-                self._set_domain_result(cache_key, success=True, raw=response2.text)
-                return self._finalize_match(
-                    result, spec, response2.text, relay, domain, cached=False
-                )
-            all_errors.append(err2)
+        # We can't decide that until we've tried primary, so we attempt it
+        # below conditionally.
 
-        # All variants failed.
+        all_errors: List[str] = []
+        all_categories: List[Optional[str]] = []
+
+        for fetch_url, _is_www in attempts:
+            response, error_msg, error_category, _ = self._fetch_with_retry(
+                fetch_url, error_label=label
+            )
+            if response is not None:
+                self._set_domain_result(cache_key, success=True, raw=response.text)
+                return self._finalize_match(
+                    result, spec, response.text, relay, domain, cached=False
+                )
+            all_errors.append(error_msg)
+            all_categories.append(error_category)
+
+            # After the primary, decide whether to try www-fallback.
+            if not _is_www and len(attempts) == 1:
+                is_connectivity = any(
+                    p in error_msg.lower() for p in _CONNECTIVITY_ERROR_PATTERNS
+                )
+                if not is_connectivity and not domain.startswith('www.'):
+                    attempts.append((f"https://www.{domain}{path}", True))
+
+        # All variants failed. Pick the most-actionable category across all
+        # attempts (e.g. uri_file_missing on either primary or www trumps a
+        # generic transport_error from the other).
+        chosen_category = next(
+            (c for c in all_categories if c in self._URI_PREFERRED_CATEGORIES),
+            all_categories[0] if all_categories else None,
+        ) or 'transport_error'
+
         combined_msg = "; ".join(e for e in all_errors if e) or "Failed to fetch URI proof"
         self._set_domain_result(
             cache_key, success=False,
-            error_msg=all_errors[0] if all_errors else combined_msg,
-            error_category=error_category,
+            error_msg=all_errors[0],
+            error_category=chosen_category,
         )
         result['error'] = combined_msg
-        result['error_category'] = error_category or 'transport_error'
+        result['error_category'] = chosen_category
         return result
 
     # ------------------------------------------------------------------
@@ -728,13 +775,18 @@ class ParallelAROIValidator:
         """Run secret-key sniff, then spec['matches']; on miss produce a
         kind- and version-appropriate not-found error with category tag."""
         label = spec['label']
-        version = result.get('ciissversion') or '2'
+        # Contract: validate_relay always sets ciissversion before we reach here.
+        version = result['ciissversion']
+        kind = spec['kind']
 
-        # Secret-key sniff (security-protective; runs for both v2 and v3, but
-        # only v3 can credibly leak a family secret_family_key. Cheap to run.)
+        # Secret-key sniff (security-protective; runs only for v3 — v2 RSA
+        # proofs cannot credibly leak a family secret_family_key, and we
+        # avoid touching v2 error/result shapes).
         if version == '3':
-            content_lines = content if isinstance(content, list) else (
-                content.splitlines() if isinstance(content, str) else []
+            content_lines = (
+                content if isinstance(content, list)
+                else content.splitlines() if isinstance(content, str)
+                else []
             )
             if _looks_like_secret_key(content_lines):
                 result['error'] = (
@@ -754,56 +806,53 @@ class ParallelAROIValidator:
             })
             return result
 
-        # Mismatch — produce a kind+version-appropriate error.
-        if spec['kind'] == 'dns':
+        # Mismatch path. Build all the parsed-content artifacts we need ONCE.
+        # v2 dns-rsa uses substring (no tokens); for others, _tokenize_proof
+        # gives the comparable set used for both error formatting and the
+        # case-mismatch diagnostic.
+        if kind == 'dns':
             found_summary = '; '.join(content)[:100] if content else 'empty'
-            if version == '2':
-                result['error'] = (
-                    f"{label}: TXT record has invalid proof content. "
-                    f"Expected {spec['expected_desc']}, found: {found_summary}"
-                )
-            else:
-                # v3: report relay's family_ids alongside found records
-                expected_ids = ', '.join(sorted(_norm_family_ids(relay))) or '(none)'
-                result['error'] = (
-                    f"{label}: TXT record content does not match relay family_ids. "
-                    f"Expected one of: {expected_ids}, found: {found_summary}"
-                )
-                # Diagnostic: case-mismatch suffix when content matches family_ids
-                # only by case-insensitive comparison.
-                if self._case_mismatch_only(content, relay, kind='dns'):
-                    result['error'] += " (case mismatch detected — spec requires case-sensitive match)"
+        else:
+            # URI: content is response.text; show first 100 chars.
+            found_summary = (content or '').strip()[:100] or 'empty'
+
+        if kind == 'dns' and version == '2':
+            # v2 dns-rsa: legacy substring-mismatch wording, no tokens needed.
+            result['error'] = (
+                f"{label}: TXT record has invalid proof content. "
+                f"Expected {spec['expected_desc']}, found: {found_summary}"
+            )
             result['error_category'] = 'dns_content_mismatch'
-        else:  # 'uri'
-            if version == '2':
-                # Preserve existing v2 wording byte-for-byte
-                result['error'] = f"{label}: Fingerprint not found at {domain}"
-            else:
-                result['error'] = f"{label}: family_id not found at {domain}"
-                if self._case_mismatch_only(content, relay, kind='uri'):
-                    result['error'] += " (case mismatch detected — spec requires case-sensitive match)"
+            return result
+
+        if kind == 'uri' and version == '2':
+            # Preserve existing v2 URI-RSA wording byte-for-byte.
+            result['error'] = f"{label}: Fingerprint not found at {domain}"
+            result['error_category'] = 'uri_content_mismatch'
+            return result
+
+        # v3 mismatch (DNS or URI). Compute family_ids and tokens once; reuse
+        # for both the error message and the case-mismatch diagnostic.
+        relay_fids = _norm_family_ids(relay)
+        tokens = _tokenize_proof(content, kind)
+        case_mismatch = (
+            bool(relay_fids)
+            and not (tokens & relay_fids)
+            and bool({t.lower() for t in tokens} & {f.lower() for f in relay_fids})
+        )
+        suffix = " (case mismatch detected — spec requires case-sensitive match)" if case_mismatch else ""
+
+        if kind == 'dns':
+            expected_ids = ', '.join(sorted(relay_fids)) or '(none)'
+            result['error'] = (
+                f"{label}: TXT record content does not match relay family_ids. "
+                f"Expected one of: {expected_ids}, found: {found_summary}{suffix}"
+            )
+            result['error_category'] = 'dns_content_mismatch'
+        else:
+            result['error'] = f"{label}: family_id not found at {domain}{suffix}"
             result['error_category'] = 'uri_content_mismatch'
         return result
-
-    @staticmethod
-    def _case_mismatch_only(content: Any, relay: Dict[str, Any], kind: str) -> bool:
-        """Return True if content matches family_ids case-insensitively but not
-        case-sensitively. Diagnostic for v3 content-mismatch errors."""
-        relay_fids = _norm_family_ids(relay)
-        if not relay_fids:
-            return False
-        if kind == 'dns':
-            tokens = {r.strip() for r in (content or []) if r.strip()}
-        else:
-            tokens = {
-                l.strip() for l in (content or '').splitlines()
-                if l.strip() and not l.strip().startswith('#')
-            }
-        if tokens & relay_fids:
-            return False  # exact match exists → not a case mismatch
-        ci_tokens = {t.lower() for t in tokens}
-        ci_fids = {f.lower() for f in relay_fids}
-        return bool(ci_tokens & ci_fids)
 
     # ------------------------------------------------------------------
     # URL parsing helpers
@@ -1075,12 +1124,8 @@ class ParallelAROIValidator:
                     if progress_callback:
                         progress_callback(completed, total_relays, result)
                 except Exception as e:
-                    error_result = {
-                        'nickname': relay.get('nickname', 'Unknown'),
-                        'fingerprint': relay.get('fingerprint', ''),
-                        'valid': False,
-                        'error': f"Validation exception: {str(e)}",
-                    }
+                    error_result = self._make_result_skeleton(relay)
+                    error_result['error'] = f"Validation exception: {str(e)}"
                     results.append(error_result)
                     completed += 1
                     if progress_callback:
