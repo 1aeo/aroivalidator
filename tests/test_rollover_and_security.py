@@ -9,6 +9,7 @@ Covers:
   - Secret-key-leak detection (DNS and URI paths)
   - Case-mismatch diagnostic
   - SSRF protections (IP literals, private/loopback ranges, redirects)
+  - Operator hostnames resolved as absolute names (no search-domain leak)
 """
 import socket
 import sys
@@ -20,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aroi_validator import (
     ParallelAROIValidator,
     is_safe_public_host,
+    _absolute_dns_name,
     _ip_is_safe,
     _clear_host_safety_cache,
     _safe_create_connection,
@@ -411,6 +413,59 @@ def test_redirect_primary_recovered_via_www():
     print("  ✓ primary 3xx + www 200: relay validates, primary error recorded as ignored note")
 
 
+def test_absolute_dns_name():
+    """Names get exactly one trailing dot. IP literals are left alone:
+    '192.0.2.1.' or '::1.' no longer parses as an address and fails to resolve."""
+    assert _absolute_dns_name('example.org') == 'example.org.'
+    assert _absolute_dns_name('www.example.org') == 'www.example.org.'
+    assert _absolute_dns_name('example.org.') == 'example.org.'
+    for literal in ('192.0.2.1', '2001:db8::1', '::1'):
+        assert _absolute_dns_name(literal) == literal
+    assert _absolute_dns_name('') == ''
+    print("  ✓ _absolute_dns_name: one trailing dot on names; IP literals and absolute names unchanged")
+
+
+def test_operator_hosts_resolved_without_search_domain():
+    """Every resolver call for an operator hostname must pass the absolute
+    name. Otherwise, when the name fails to resolve, the system resolver
+    retries it with the validator host's search domain appended
+    (www.<domain> -> www.<domain>.<search-domain>), leaking it to that zone.
+
+    Drives the www-fallback flow through the real requests/urllib3 stack,
+    plus the TLS-certificate diagnostic. Hermetic: getaddrinfo is mocked to
+    fail every lookup.
+    """
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    # Environment proxies would route the fetch around _safe_create_connection.
+    v.session.trust_env = False
+    relay = {
+        'nickname': 'SearchDomainRelay',
+        'fingerprint': 'J' * 40,
+        'family_ids': ['fid'],
+        'contact': 'url:operator.invalid proof:uri-familyid-ed25519 ciissversion:3',
+    }
+    looked_up = []
+
+    def failing_getaddrinfo(host, *args, **kwargs):
+        looked_up.append(host)
+        raise socket.gaierror(socket.EAI_NONAME, 'Name or service not known')
+
+    with patch('aroi_validator.socket.getaddrinfo', side_effect=failing_getaddrinfo):
+        out = v.validate_relay(relay)
+        cert_info = v._get_ssl_cert_info('www.operator.invalid')
+
+    assert set(looked_up) == {'operator.invalid.', 'www.operator.invalid.'}, (
+        f"resolver must only see absolute names; got {looked_up}"
+    )
+    assert 'error' in cert_info, cert_info
+    # The fetch URLs and error messages keep the plain hostname.
+    assert out['valid'] is False, out
+    assert 'https://www.operator.invalid/.well-known/' in out['error'], out
+    assert 'operator.invalid.' not in out['error'], out
+    print("  ✓ safety check, connect and TLS-cert lookups all use absolute names; messages keep plain names")
+
+
 def main():
     print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
@@ -425,6 +480,8 @@ def main():
     test_dns_rebinding_blocked_at_connect()
     test_redirect_both_primary_and_www_fail()
     test_redirect_primary_recovered_via_www()
+    test_absolute_dns_name()
+    test_operator_hosts_resolved_without_search_domain()
     print("\nAll mocked-input tests passed.")
     return 0
 
