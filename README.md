@@ -218,8 +218,10 @@ Tests for these protections live in `tests/test_rollover_and_security.py`
 `test_uri_validation_blocked_*`, `test_dns_rebinding_blocked`,
 `test_redirect_*`, `test_absolute_dns_name`,
 `test_operator_hosts_resolved_without_search_domain`,
+`test_absolute_dns_name_unicode_full_stops`,
 `test_numeric_shorthand_is_ip_literal`,
-`test_hosts_file_only_name_not_consulted`). Run them with
+`test_hosts_file_only_name_not_consulted`,
+`test_fetch_sends_plain_sni_and_host_header`). Run them with
 `pytest` or directly via `python3 tests/test_rollover_and_security.py`.
 
 ### TLS/SSL Configuration
