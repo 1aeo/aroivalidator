@@ -11,6 +11,7 @@ Covers:
   - SSRF protections (IP literals, private/loopback ranges, redirects)
   - Operator hostnames resolved as absolute names (no search-domain leak)
   - Hostnames ending in a Unicode full stop, or with an empty label, fail cleanly
+  - IPv4 shorthand (127.1, 0x7f.1) treated as IP literals; hosts-file-only names
 """
 import socket
 import sys
@@ -24,6 +25,7 @@ from aroi_validator import (
     is_safe_public_host,
     _absolute_dns_name,
     _ip_is_safe,
+    _is_ip_literal,
     _clear_host_safety_cache,
     _safe_create_connection,
     SSRFBlockedError,
@@ -554,6 +556,97 @@ def test_relay_with_malformed_hostname_fails_cleanly():
     print("  ✓ url ending in a Unicode full stop or with an empty label: transport_error, cache entry resolved")
 
 
+def test_numeric_shorthand_is_ip_literal():
+    """glibc's getaddrinfo parses every IPv4 form inet_aton accepts as an
+    address: 127.1 and 0x7f.1 are 127.0.0.1, 010.0.0.1 is 8.0.0.1. They must
+    be rejected like 127.0.0.1, with no lookup, and keep no trailing dot
+    ('127.1.' is a name and would be sent to DNS)."""
+    literals = ('127.1', '127.0.1', '127.000.000.001', '0x7f.1', '0177.0.0.1',
+                '010.0.0.1', '2130706433', '0x7f000001', '1.2.3', '4294967295',
+                '\uff11\uff12\uff17.0.0.1')  # fullwidth digits; IDNA maps them to ASCII
+    names = ('123.example', 'xn--1.com', '1.com', '0x7f.com', '127.1.', '127..1',
+             '127.1 x', '127.1\t', '256.1', '1.2.3.256', '08.0.0.1', '1e2',
+             '1.2.3.4.5')
+    for host in literals:
+        assert _is_ip_literal(host), host
+        assert _absolute_dns_name(host) == host, host
+    for host in names:
+        assert not _is_ip_literal(host), host
+
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    relay = {
+        'nickname': 'ShorthandRelay',
+        'fingerprint': 'K' * 40,
+        'family_ids': ['fid'],
+        'contact': 'url:https://0x7f.1 proof:uri-familyid-ed25519 ciissversion:3',
+    }
+    looked_up = []
+
+    def failing_getaddrinfo(host, *args, **kwargs):
+        looked_up.append(host)
+        raise socket.gaierror(socket.EAI_NONAME, 'Name or service not known')
+
+    with patch('aroi_validator.socket.getaddrinfo', side_effect=failing_getaddrinfo), \
+         patch.object(v, '_fetch_with_retry') as mock_fetch:
+        for host in literals:
+            safe, reason = is_safe_public_host(host)
+            assert not safe and 'IP literal' in reason, (host, safe, reason)
+        out = v.validate_relay(relay)
+
+    assert looked_up == [], f"IP literals must not be resolved; got {looked_up}"
+    assert mock_fetch.call_count == 0, mock_fetch.call_count
+    assert out['error_category'] == 'unsafe_target', out
+    print("  ✓ IPv4 shorthand (127.1, 0x7f.1, 010.0.0.1) rejected as IP literal with no lookup; names unaffected")
+
+
+def test_hosts_file_only_name_not_consulted():
+    """Operator hostnames are resolved by DNS, not by the validator host's
+    /etc/hosts: glibc's hosts-file backend doesn't match the absolute name
+    the validator passes. A name only the hosts file knows must fail to
+    resolve, and nothing may connect to the address the hosts file gives.
+
+    Hermetic: getaddrinfo is mocked to answer like glibc with a hosts entry
+    for the relative names only; socket.socket is a tripwire.
+    """
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    # Environment proxies would route the fetch around _safe_create_connection.
+    v.session.trust_env = False
+    relay = {
+        'nickname': 'HostsFileRelay',
+        'fingerprint': 'L' * 40,
+        'family_ids': ['fid'],
+        'contact': 'url:hostsonly.invalid proof:uri-familyid-ed25519 ciissversion:3',
+    }
+    hosts_file = {'hostsonly.invalid': '93.184.216.34',
+                  'www.hostsonly.invalid': '93.184.216.34'}
+    looked_up = []
+    sockets = []
+
+    def hosts_file_getaddrinfo(host, port=None, *args, **kwargs):
+        looked_up.append(host)
+        if host in hosts_file:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (hosts_file[host], port or 0))]
+        raise socket.gaierror(socket.EAI_NONAME, 'Name or service not known')
+
+    def tripwire_socket(*args, **kwargs):
+        sockets.append(args)
+        raise OSError("tripwire: socket() called")
+
+    with patch('aroi_validator.socket.getaddrinfo', side_effect=hosts_file_getaddrinfo), \
+         patch('aroi_validator.socket.socket', side_effect=tripwire_socket):
+        out = v.validate_relay(relay)
+
+    assert looked_up and all(h.endswith('.') for h in looked_up), (
+        f"resolver must only see absolute names; got {looked_up}"
+    )
+    assert sockets == [], f"socket() was called {len(sockets)} time(s)"
+    assert out['valid'] is False, out
+    assert out['error_category'] == 'transport_error', out
+    print("  ✓ hosts-file-only name: not consulted, fails closed as transport_error, no connection")
+
+
 def main():
     print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
@@ -573,6 +666,8 @@ def main():
     test_absolute_dns_name_unicode_full_stops()
     test_malformed_hostnames_fail_cleanly()
     test_relay_with_malformed_hostname_fails_cleanly()
+    test_numeric_shorthand_is_ip_literal()
+    test_hosts_file_only_name_not_consulted()
     print("\nAll mocked-input tests passed.")
     return 0
 

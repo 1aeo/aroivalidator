@@ -145,6 +145,34 @@ def _ip_is_safe(ip: str) -> bool:
     return bool(ip_obj.is_global) and not ip_obj.is_multicast
 
 
+def _is_ip_literal(host: str) -> bool:
+    """Return True if getaddrinfo would parse host as an address, not a name.
+
+    Besides canonical addresses, glibc's getaddrinfo takes every IPv4 form
+    inet_aton does: fewer than four parts (127.1), octal (0177.0.0.1,
+    127.000.000.001) and hex (0x7f.1). The socket module IDNA-encodes the
+    name first, which maps e.g. fullwidth digits to ASCII.
+    """
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    try:
+        name = host.encode('idna').decode('ascii')
+    except UnicodeError:
+        return False
+    # inet_aton ignores whitespace and anything after it ('127.1 x');
+    # getaddrinfo needs the whole name to be the address.
+    if any(c.isspace() for c in name):
+        return False
+    try:
+        socket.inet_aton(name)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _absolute_dns_name(host: str) -> str:
     """Return host with a trailing dot, for passing to the system resolver.
 
@@ -152,27 +180,29 @@ def _absolute_dns_name(host: str) -> str:
     domain: after the name fails to resolve, or first when it has fewer
     dots than `ndots`. That sends operator hostnames to the validator
     host's own DNS zone (www.example.org -> www.example.org.<search-domain>)
-    and can resolve them to a host inside it. URLs, SNI, certificate checks
-    and messages must keep the plain name. IP literals and names that are
-    already absolute are returned unchanged. A name ending in a Unicode full
-    stop (U+3002, U+FF0E, U+FF61) is already absolute: the idna codec reads
-    those as '.', and a second root dot would be an empty label it rejects.
+    and can resolve them to a host inside it. glibc's hosts-file backend
+    doesn't match trailing-dot names either, so /etc/hosts is deliberately
+    not consulted: a name listed only there fails to resolve. URLs, SNI,
+    certificate checks and messages must keep the plain name. IP literals
+    (in any form, see _is_ip_literal) and names that are already absolute
+    are returned unchanged. A name ending in a Unicode full stop (U+3002,
+    U+FF0E, U+FF61) is already absolute: the idna codec reads those as '.',
+    and a second root dot would be an empty label it rejects.
     """
-    if not host or host[-1] in '.\u3002\uff0e\uff61':
+    if not host or host[-1] in '.\u3002\uff0e\uff61' or _is_ip_literal(host):
         return host
-    try:
-        ipaddress.ip_address(host)
-        return host
-    except ValueError:
-        return host + '.'
+    return host + '.'
 
 
 def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
     """Check whether hostname is safe to HTTPS-fetch.
 
-    Rejects IP-literal hostnames outright, then resolves A/AAAA and rejects
-    if any resolved address is in a private/loopback/link-local/reserved/
-    multicast/unspecified range. Result cached per validator run.
+    Rejects IP-literal hostnames outright, including shorthand such as
+    127.1 or 0x7f.1, then resolves A/AAAA and rejects if any resolved
+    address is in a private/loopback/link-local/reserved/multicast/
+    unspecified range. The name is resolved as an absolute name, so
+    /etc/hosts and resolv.conf search domains are not consulted.
+    Result cached per validator run.
 
     Returns:
         (safe: bool, reason: str). reason is the rejection cause when
@@ -187,14 +217,11 @@ def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
 
     # 1. Reject IP-literal hostnames. ContactInfo `url:` should be a domain,
     #    not an IP. CIISS spec describes URLs / FQDNs.
-    try:
-        ipaddress.ip_address(hostname)
+    if _is_ip_literal(hostname):
         result = (False, "url is an IP literal, not a domain")
         with _HOST_SAFETY_LOCK:
             _HOST_SAFETY_CACHE[hostname] = result
         return result
-    except ValueError:
-        pass  # Not an IP literal — good.
 
     # 2. Resolve the hostname and check every returned address.
     try:

@@ -147,6 +147,9 @@ The validator's protection is **enforced at the actual connect call**, not
 just by a separate pre-flight resolve. Specifically:
 
 1. **IP-literal hostnames are rejected outright** before any DNS work.
+   That includes every form `getaddrinfo` parses as an address, not
+   just the dotted quad: `127.1`, `0x7f.1` and `127.000.000.001` are
+   all 127.0.0.1, and `010.0.0.1` is 8.0.0.1.
 2. **`is_safe_public_host()` pre-flight** rejects `url:` values whose
    `getaddrinfo` returns no globally-routable address. This is a cheap
    fast-path that produces a clean `unsafe_target` error without burning
@@ -190,9 +193,13 @@ just by a separate pre-flight resolve. Specifically:
    validator's own DNS zone and possibly resolving them to a host inside
    it. With `ndots` above 1 (Kubernetes defaults to 5) the search domains
    are tried first, for every name. URLs, the `Host` header, SNI,
-   certificate matching and error messages keep the plain name. glibc's
-   hosts-file backend doesn't match trailing-dot names, so `/etc/hosts` is
-   not consulted for these lookups.
+   certificate matching and error messages keep the plain name. IP
+   literals, including the shorthand forms above, are passed unchanged
+   (`127.1.` would be a name). This is deliberate: operator hostnames
+   are DNS names, so neither the validator host's search domains nor
+   its `/etc/hosts` are consulted (glibc's hosts-file backend doesn't
+   match trailing-dot names), and a name that only resolves there fails
+   as a `transport_error`.
 
 The connect-time gate is scoped to the relay-fetch `requests.Session`
 (via the custom `SecureTLSAdapter` mounting `_SSRFSafePoolManager`).
@@ -205,7 +212,9 @@ Tests for these protections live in `tests/test_rollover_and_security.py`
 (`test_ip_safety_classification`, `test_is_safe_public_host_*`,
 `test_uri_validation_blocked_*`, `test_dns_rebinding_blocked`,
 `test_redirect_*`, `test_absolute_dns_name`,
-`test_operator_hosts_resolved_without_search_domain`). Run them with
+`test_operator_hosts_resolved_without_search_domain`,
+`test_numeric_shorthand_is_ip_literal`,
+`test_hosts_file_only_name_not_consulted`). Run them with
 `pytest` or directly via `python3 tests/test_rollover_and_security.py`.
 
 ### TLS/SSL Configuration
