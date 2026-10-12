@@ -184,8 +184,8 @@ just by a separate pre-flight resolve. Specifically:
    combination of 3xx, 404, transport error), the relay fails with the
    most actionable `error_category` (`uri_file_missing` > `redirect_disallowed`
    > `transport_error`).
-6. **Hostnames are resolved as absolute DNS names.** The pre-flight, the
-   connect-time gate and the TLS-certificate diagnostic hand the resolver
+6. **Hostnames are resolved as absolute DNS names.** The pre-flight and
+   the connect-time gate hand the resolver
    `www.example.org.` (trailing dot), never `www.example.org`. Otherwise a
    name that fails to resolve, typically the www-fallback, is retried with
    the validator host's `resolv.conf` search domain appended
@@ -232,10 +232,13 @@ relay operator domains. CIISS v3 spec mandates HTTPS endpoints for proof
 URIs MUST use certificates from a well-known trusted certificate authority
 (e.g. Let's Encrypt). We enforce that.
 
-Operators with self-signed or otherwise non-trusted certificates will see
-their relay validation fail with `URI-RSA: HTTP SSL certificate
-verification failed` (or the URI-FamilyID equivalent for v3) and a
-specific category-tagged error pointing them at the fix.
+Operators with expired, self-signed or otherwise non-trusted certificates
+will see their relay validation fail with a `URI-RSA: HTTP SSL ...` error
+(or the URI-FamilyID equivalent for v3) naming the problem OpenSSL
+reported, e.g. `certificate expired` or `hostname mismatch`, with
+`error_category` `transport_error`. The message is built from the failed
+handshake itself; the validator does not reconnect to read the certificate,
+so it does not report expiry dates, issuers or certificate names.
 
 Verification can be disabled programmatically (e.g. for testing or
 specialised deployments) by passing `verify_certificates=False` to
@@ -314,17 +317,16 @@ The validator produces standardized error messages categorized by proof type. Ea
 
 | Error Message |
 |---------------|
-| `URI-RSA: HTTP SSL handshake failure due to older version <version> for <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL handshake failure due to SSLv3 handshake for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate expired for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate is self-signed for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate chain ends in an untrusted root CA for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate chain incomplete or issued by an untrusted CA for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL hostname mismatch, certificate is not valid for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL certificate verification failed (<OpenSSL verify message>) for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL handshake failure (server does not support TLS 1.2 or newer) for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL handshake failure (server sent handshake_failure alert) for <domain> at URL: <URL>` |
 | `URI-RSA: HTTP SSL error unexpected EOF for <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL certificate verification failed for <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL certificate expired on <date> for <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL certificate is self-signed (issuer: <issuer>) for <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL certificate chain contains self-signed cert (issuer: <issuer>) for <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL certificate chain incomplete for <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL unknown CA "<issuer>" for <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL hostname mismatch for remote <hosts> but expected <domain> at URL: <URL>` |
-| `URI-RSA: HTTP SSL error <error> for <domain> at URL: <URL>` |
+| `URI-RSA: HTTP SSL error <OpenSSL error> for <domain> at URL: <URL>` |
 
 ### URI-RSA: HTTP Name Resolution Errors
 
