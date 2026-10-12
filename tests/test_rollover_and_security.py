@@ -10,6 +10,7 @@ Covers:
   - Case-mismatch diagnostic
   - SSRF protections (IP literals, private/loopback ranges, redirects)
   - Operator hostnames resolved as absolute names (no search-domain leak)
+  - Hostnames ending in a Unicode full stop, or with an empty label, fail cleanly
 """
 import socket
 import sys
@@ -466,6 +467,93 @@ def test_operator_hosts_resolved_without_search_domain():
     print("  ✓ safety check, connect and TLS-cert lookups all use absolute names; messages keep plain names")
 
 
+UNICODE_FULL_STOPS = ('\u3002', '\uff0e', '\uff61')
+
+
+def _idna_then_fail_getaddrinfo(looked_up):
+    """getaddrinfo stand-in that encodes the name with the idna codec, as the
+    real one does before any query (raising UnicodeError for an empty or
+    over-long label), records the encoded name, then fails the lookup."""
+    def fake_getaddrinfo(host, *args, **kwargs):
+        looked_up.append(host.encode('idna'))
+        raise socket.gaierror(socket.EAI_NONAME, 'Name or service not known')
+    return fake_getaddrinfo
+
+
+def test_absolute_dns_name_unicode_full_stops():
+    """The idna codec reads U+3002, U+FF0E and U+FF61 as '.', so a name
+    ending in one is already absolute. Adding a root dot would make an empty
+    label, which getaddrinfo rejects with UnicodeError."""
+    for stop in UNICODE_FULL_STOPS:
+        name = 'example.org' + stop
+        assert _absolute_dns_name(name) == name, repr(stop)
+        assert _absolute_dns_name(name).encode('idna') == b'example.org.', repr(stop)
+        # A Unicode full stop inside the name is a separator, not the root.
+        inner = 'example' + stop + 'org'
+        assert _absolute_dns_name(inner).encode('idna') == b'example.org.', repr(stop)
+    print("  ✓ _absolute_dns_name: names ending in a Unicode full stop stay absolute and encodable")
+
+
+def test_malformed_hostnames_fail_cleanly():
+    """Names the idna codec rejects (empty or over-long label) must not raise
+    UnicodeError out of the safety check, the connect or the TLS-cert lookup."""
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    names = [
+        'operator..invalid', '.operator.invalid', 'operator.invalid..',
+        'a' * 64 + '.invalid',
+    ] + ['operator.invalid' + stop + '.' for stop in UNICODE_FULL_STOPS]
+    for name in names:
+        with patch('aroi_validator.socket.getaddrinfo',
+                   side_effect=_idna_then_fail_getaddrinfo([])):
+            safe, reason = is_safe_public_host(name)
+            assert safe is True and reason.startswith('unresolved'), (name, safe, reason)
+            try:
+                _safe_create_connection((name, 443), timeout=2)
+                raise AssertionError(f"{name!r}: connect should fail")
+            except socket.gaierror:
+                pass  # urllib3 reports it as a NameResolutionError
+            cert_info = v._get_ssl_cert_info(name)
+            assert 'error' in cert_info, (name, cert_info)
+    print("  ✓ empty/over-long labels: safety check, connect and TLS-cert lookup fail without UnicodeError")
+
+
+def test_relay_with_malformed_hostname_fails_cleanly():
+    """validate_relay must return a categorized failure, and resolve the
+    domain-cache entry, for a url ending in a Unicode full stop or holding an
+    empty label. An escaped exception left the entry 'pending', so every other
+    relay sharing the domain waited for the cache timeout."""
+    names = ['operator.invalid' + stop for stop in UNICODE_FULL_STOPS]
+    names.append('operator..invalid')
+    for name in names:
+        _clear_host_safety_cache()
+        v = ParallelAROIValidator(max_workers=1)
+        v.session.trust_env = False
+        relay = {
+            'nickname': 'MalformedHostRelay',
+            'fingerprint': 'K' * 40,
+            'family_ids': ['fid'],
+            'contact': f'url:https://{name} proof:uri-familyid-ed25519 ciissversion:3',
+        }
+        looked_up = []
+        with patch('aroi_validator.socket.getaddrinfo',
+                   side_effect=_idna_then_fail_getaddrinfo(looked_up)):
+            out = v.validate_relay(relay)
+
+        assert out['valid'] is False, out
+        assert out['error_category'] == 'transport_error', (name, out)
+        entry = v._domain_cache[(out['domain'], 'uri-familyid-ed25519')]
+        assert entry['status'] != 'pending', (name, entry)
+        if name[-1] in UNICODE_FULL_STOPS:
+            # The safety check resolves both hosts as absolute names; urllib3
+            # then rejects the URL itself, so no connect-time lookup follows.
+            assert set(looked_up) == {b'operator.invalid.', b'www.operator.invalid.'}, (name, looked_up)
+        else:
+            assert looked_up == [], (name, looked_up)
+            assert 'name resolution failed' in out['error'], (name, out)
+    print("  ✓ url ending in a Unicode full stop or with an empty label: transport_error, cache entry resolved")
+
+
 def main():
     print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
@@ -482,6 +570,9 @@ def main():
     test_redirect_primary_recovered_via_www()
     test_absolute_dns_name()
     test_operator_hosts_resolved_without_search_domain()
+    test_absolute_dns_name_unicode_full_stops()
+    test_malformed_hostnames_fail_cleanly()
+    test_relay_with_malformed_hostname_fails_cleanly()
     print("\nAll mocked-input tests passed.")
     return 0
 
