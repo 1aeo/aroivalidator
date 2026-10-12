@@ -181,6 +181,18 @@ just by a separate pre-flight resolve. Specifically:
    combination of 3xx, 404, transport error), the relay fails with the
    most actionable `error_category` (`uri_file_missing` > `redirect_disallowed`
    > `transport_error`).
+6. **Hostnames are resolved as absolute DNS names.** The pre-flight, the
+   connect-time gate and the TLS-certificate diagnostic hand the resolver
+   `www.example.org.` (trailing dot), never `www.example.org`. Otherwise a
+   name that fails to resolve, typically the www-fallback, is retried with
+   the validator host's `resolv.conf` search domain appended
+   (`www.example.org.<search-domain>`), sending operator hostnames to the
+   validator's own DNS zone and possibly resolving them to a host inside
+   it. With `ndots` above 1 (Kubernetes defaults to 5) the search domains
+   are tried first, for every name. URLs, the `Host` header, SNI,
+   certificate matching and error messages keep the plain name. glibc's
+   hosts-file backend doesn't match trailing-dot names, so `/etc/hosts` is
+   not consulted for these lookups.
 
 The connect-time gate is scoped to the relay-fetch `requests.Session`
 (via the custom `SecureTLSAdapter` mounting `_SSRFSafePoolManager`).
@@ -192,8 +204,9 @@ routable address — Onionoo's IPs are public.
 Tests for these protections live in `tests/test_rollover_and_security.py`
 (`test_ip_safety_classification`, `test_is_safe_public_host_*`,
 `test_uri_validation_blocked_*`, `test_dns_rebinding_blocked`,
-`test_redirect_*`). Run them with `pytest` or directly via
-`python3 tests/test_rollover_and_security.py`.
+`test_redirect_*`, `test_absolute_dns_name`,
+`test_operator_hosts_resolved_without_search_domain`). Run them with
+`pytest` or directly via `python3 tests/test_rollover_and_security.py`.
 
 ### TLS/SSL Configuration
 
