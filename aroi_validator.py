@@ -154,9 +154,11 @@ def _absolute_dns_name(host: str) -> str:
     host's own DNS zone (www.example.org -> www.example.org.<search-domain>)
     and can resolve them to a host inside it. URLs, SNI, certificate checks
     and messages must keep the plain name. IP literals and names that are
-    already absolute are returned unchanged.
+    already absolute are returned unchanged. A name ending in a Unicode full
+    stop (U+3002, U+FF0E, U+FF61) is already absolute: the idna codec reads
+    those as '.', and a second root dot would be an empty label it rejects.
     """
-    if not host or host.endswith('.'):
+    if not host or host[-1] in '.\u3002\uff0e\uff61':
         return host
     try:
         ipaddress.ip_address(host)
@@ -200,9 +202,11 @@ def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
             _absolute_dns_name(hostname), None,
             type=socket.SOCK_STREAM,
         )
-    except (socket.gaierror, OSError) as e:
+    except (socket.gaierror, OSError, UnicodeError) as e:
         # Couldn't resolve — let the actual fetch fail with a meaningful
-        # transport error. Don't cache, in case it's transient.
+        # transport error. Don't cache, in case it's transient. UnicodeError
+        # is the idna codec rejecting a malformed name (empty or over-long
+        # label); the connect-time lookup fails the same way.
         return True, f"unresolved (defer to fetch): {e}"
 
     ips = {info[4][0] for info in infos}
@@ -288,6 +292,10 @@ def _safe_create_connection(
         infos = socket.getaddrinfo(_absolute_dns_name(host), port, 0, socket.SOCK_STREAM)
     except socket.gaierror:
         raise  # surface as urllib3 NameResolutionError
+    except UnicodeError as e:
+        # The idna codec rejects malformed names (empty or over-long label)
+        # before any lookup; report it as a resolution failure too.
+        raise socket.gaierror(f"invalid hostname: {e}") from e
 
     for af, socktype, proto, _canon, sa in infos:
         ip_str = sa[0]
@@ -1524,7 +1532,7 @@ class ParallelAROIValidator:
                         'hostnames': list(set([cn] + san)) if cn else san,
                         'tls_version': tls_version,
                     }
-        except (socket.error, ssl.SSLError, OSError) as e:
+        except (socket.error, ssl.SSLError, OSError, UnicodeError) as e:
             return {'error': str(e)}
 
     # ------------------------------------------------------------------
