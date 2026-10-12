@@ -195,6 +195,17 @@ Tests for these protections live in `tests/test_rollover_and_security.py`
 `test_redirect_*`). Run them with `pytest` or directly via
 `python3 tests/test_rollover_and_security.py`.
 
+### DNS search-domain leaks
+
+Operator hostnames are resolved as **absolute names** (trailing dot, via
+`_absolute_dns_name()`) in `is_safe_public_host()`, `_safe_create_connection()`
+and `_get_ssl_cert_info()`. Otherwise, when a lookup fails (often the
+`www.<domain>` fallback), the system resolver retries it with the host's
+`search` domain appended (e.g. `www.example.org.1aeo.com`), leaking operator
+domains to that zone and its resolvers. TLS SNI still uses the undotted
+hostname. Covered by `test_absolute_dns_name` and
+`test_lookups_skip_dns_search_domains`.
+
 ### TLS/SSL Configuration
 
 The validator uses configurable TLS settings to balance security with compatibility:

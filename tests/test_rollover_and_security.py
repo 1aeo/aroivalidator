@@ -23,6 +23,7 @@ from aroi_validator import (
     _ip_is_safe,
     _clear_host_safety_cache,
     _safe_create_connection,
+    _absolute_dns_name,
     SSRFBlockedError,
 )
 
@@ -411,6 +412,45 @@ def test_redirect_primary_recovered_via_www():
     print("  ✓ primary 3xx + www 200: relay validates, primary error recorded as ignored note")
 
 
+def test_absolute_dns_name():
+    """Hostnames become absolute (trailing dot) so the system resolver never
+    appends the host's DNS search domain; IP literals, empty and already
+    absolute names are unchanged."""
+    assert _absolute_dns_name('example.org') == 'example.org.'
+    assert _absolute_dns_name('www.example.org') == 'www.example.org.'
+    assert _absolute_dns_name('example.org.') == 'example.org.'
+    for unchanged in ('', '192.0.2.1', '2001:db8::1'):
+        assert _absolute_dns_name(unchanged) == unchanged, unchanged
+    print("  ✓ _absolute_dns_name: hostnames made absolute, IP literals/empty unchanged")
+
+
+def test_lookups_skip_dns_search_domains():
+    """Every system-resolver lookup (pre-flight safety check, connect-time
+    getaddrinfo, TLS cert probe) must use an absolute name. Otherwise a
+    failed lookup -- typically the www. fallback -- is retried with the
+    host's search domain appended (e.g. www.example.org.1aeo.com).
+    TLS SNI must keep the undotted hostname."""
+    _clear_host_safety_cache()
+    host = 'www.public.invalid'  # www-fallback host shape that leaked
+    public = [(socket.AF_INET, socket.SOCK_STREAM, 0, '', ('93.184.216.34', 443))]
+    with patch('aroi_validator.socket.getaddrinfo', return_value=public) as gai, \
+         patch('aroi_validator.socket.socket'):
+        is_safe_public_host(host)
+        _safe_create_connection((host, 443), timeout=2)
+    names = [c.args[0] for c in gai.call_args_list]
+    assert names == [host + '.', host + '.'], names
+
+    v = ParallelAROIValidator(max_workers=1)
+    with patch('aroi_validator.socket.create_connection') as cc, \
+         patch('aroi_validator.ssl.create_default_context') as ctx:
+        ssock = ctx.return_value.wrap_socket.return_value.__enter__.return_value
+        ssock.getpeercert.return_value = {}
+        v._get_ssl_cert_info(host)
+    assert cc.call_args.args[0] == (host + '.', 443), cc.call_args
+    assert ctx.return_value.wrap_socket.call_args.kwargs['server_hostname'] == host
+    print("  ✓ getaddrinfo/create_connection get absolute names; SNI stays undotted")
+
+
 def main():
     print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
@@ -425,6 +465,8 @@ def main():
     test_dns_rebinding_blocked_at_connect()
     test_redirect_both_primary_and_www_fail()
     test_redirect_primary_recovered_via_www()
+    test_absolute_dns_name()
+    test_lookups_skip_dns_search_domains()
     print("\nAll mocked-input tests passed.")
     return 0
 

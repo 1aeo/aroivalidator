@@ -145,6 +145,19 @@ def _ip_is_safe(ip: str) -> bool:
     return bool(ip_obj.is_global) and not ip_obj.is_multicast
 
 
+def _absolute_dns_name(host: str) -> str:
+    """Return host as an absolute DNS name (trailing dot) so the system
+    resolver never appends the machine's search domain to it. IP literals
+    and already-absolute names are returned unchanged."""
+    if not host or host.endswith('.'):
+        return host
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        return host + '.'
+
+
 def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
     """Check whether hostname is safe to HTTPS-fetch.
 
@@ -177,7 +190,7 @@ def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
     # 2. Resolve the hostname and check every returned address.
     try:
         infos = socket.getaddrinfo(
-            hostname, None,
+            _absolute_dns_name(hostname), None,
             type=socket.SOCK_STREAM,
         )
     except (socket.gaierror, OSError) as e:
@@ -265,7 +278,7 @@ def _safe_create_connection(
     err = None
     safe_seen = False
     try:
-        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+        infos = socket.getaddrinfo(_absolute_dns_name(host), port, 0, socket.SOCK_STREAM)
     except socket.gaierror:
         raise  # surface as urllib3 NameResolutionError
 
@@ -1474,7 +1487,7 @@ class ParallelAROIValidator:
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
 
-            with socket.create_connection((hostname, port), timeout=5) as sock:
+            with socket.create_connection((_absolute_dns_name(hostname), port), timeout=5) as sock:
                 with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                     cert = ssock.getpeercert(binary_form=False)
                     tls_version = ssock.version()
