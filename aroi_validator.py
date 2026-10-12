@@ -11,10 +11,12 @@ import concurrent.futures
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
 import ssl
 import string
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +55,10 @@ PROOF_TYPE_URI_FAMILYID_ED25519 = "uri-familyid-ed25519"
 
 # Connectivity error indicators (used for cache decisions)
 _CONNECTIVITY_ERROR_PATTERNS = ('timed out', 'connection refused', 'connection reset', 'connection error')
+
+# Longest DNS name, in characters. Longer url hosts are rejected before any
+# IDNA encoding: the idna codec's punycode step is quadratic in label length.
+_MAX_HOSTNAME_LENGTH = 253
 
 # Pre-compiled regex patterns for AROI field parsing
 _AROI_PATTERNS = {
@@ -145,6 +151,34 @@ def _ip_is_safe(ip: str) -> bool:
     return bool(ip_obj.is_global) and not ip_obj.is_multicast
 
 
+def _is_ip_literal(host: str) -> bool:
+    """Return True if getaddrinfo would parse host as an address, not a name.
+
+    Besides canonical addresses, glibc's getaddrinfo takes every IPv4 form
+    inet_aton does: fewer than four parts (127.1), octal (0177.0.0.1,
+    127.000.000.001) and hex (0x7f.1). The socket module IDNA-encodes the
+    name first, which maps e.g. fullwidth digits to ASCII.
+    """
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    try:
+        name = host.encode('idna').decode('ascii')
+    except UnicodeError:
+        return False
+    # inet_aton ignores whitespace and anything after it ('127.1 x');
+    # getaddrinfo needs the whole name to be the address.
+    if any(c.isspace() for c in name):
+        return False
+    try:
+        socket.inet_aton(name)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
 def _absolute_dns_name(host: str) -> str:
     """Return host with a trailing dot, for passing to the system resolver.
 
@@ -152,25 +186,29 @@ def _absolute_dns_name(host: str) -> str:
     domain: after the name fails to resolve, or first when it has fewer
     dots than `ndots`. That sends operator hostnames to the validator
     host's own DNS zone (www.example.org -> www.example.org.<search-domain>)
-    and can resolve them to a host inside it. URLs, SNI, certificate checks
-    and messages must keep the plain name. IP literals and names that are
-    already absolute are returned unchanged.
+    and can resolve them to a host inside it. glibc's hosts-file backend
+    doesn't match trailing-dot names either, so /etc/hosts is deliberately
+    not consulted: a name listed only there fails to resolve. URLs, SNI,
+    certificate checks and messages must keep the plain name. IP literals
+    (in any form, see _is_ip_literal) and names that are already absolute
+    are returned unchanged. A name ending in a Unicode full stop (U+3002,
+    U+FF0E, U+FF61) is already absolute: the idna codec reads those as '.',
+    and a second root dot would be an empty label it rejects.
     """
-    if not host or host.endswith('.'):
+    if not host or host[-1] in '.\u3002\uff0e\uff61' or _is_ip_literal(host):
         return host
-    try:
-        ipaddress.ip_address(host)
-        return host
-    except ValueError:
-        return host + '.'
+    return host + '.'
 
 
 def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
     """Check whether hostname is safe to HTTPS-fetch.
 
-    Rejects IP-literal hostnames outright, then resolves A/AAAA and rejects
-    if any resolved address is in a private/loopback/link-local/reserved/
-    multicast/unspecified range. Result cached per validator run.
+    Rejects IP-literal hostnames outright, including shorthand such as
+    127.1 or 0x7f.1, then resolves A/AAAA and rejects if any resolved
+    address is in a private/loopback/link-local/reserved/multicast/
+    unspecified range. The name is resolved as an absolute name, so
+    /etc/hosts and resolv.conf search domains are not consulted.
+    Result cached per validator run.
 
     Returns:
         (safe: bool, reason: str). reason is the rejection cause when
@@ -185,14 +223,11 @@ def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
 
     # 1. Reject IP-literal hostnames. ContactInfo `url:` should be a domain,
     #    not an IP. CIISS spec describes URLs / FQDNs.
-    try:
-        ipaddress.ip_address(hostname)
+    if _is_ip_literal(hostname):
         result = (False, "url is an IP literal, not a domain")
         with _HOST_SAFETY_LOCK:
             _HOST_SAFETY_CACHE[hostname] = result
         return result
-    except ValueError:
-        pass  # Not an IP literal — good.
 
     # 2. Resolve the hostname and check every returned address.
     try:
@@ -200,9 +235,11 @@ def is_safe_public_host(hostname: str) -> Tuple[bool, str]:
             _absolute_dns_name(hostname), None,
             type=socket.SOCK_STREAM,
         )
-    except (socket.gaierror, OSError) as e:
+    except (socket.gaierror, OSError, UnicodeError) as e:
         # Couldn't resolve — let the actual fetch fail with a meaningful
-        # transport error. Don't cache, in case it's transient.
+        # transport error. Don't cache, in case it's transient. UnicodeError
+        # is the idna codec rejecting a malformed name (empty or over-long
+        # label); the connect-time lookup fails the same way.
         return True, f"unresolved (defer to fetch): {e}"
 
     ips = {info[4][0] for info in infos}
@@ -288,6 +325,10 @@ def _safe_create_connection(
         infos = socket.getaddrinfo(_absolute_dns_name(host), port, 0, socket.SOCK_STREAM)
     except socket.gaierror:
         raise  # surface as urllib3 NameResolutionError
+    except UnicodeError as e:
+        # The idna codec rejects malformed names (empty or over-long label)
+        # before any lookup; report it as a resolution failure too.
+        raise socket.gaierror(f"invalid hostname: {e}") from e
 
     for af, socktype, proto, _canon, sa in infos:
         ip_str = sa[0]
@@ -1292,7 +1333,10 @@ class ParallelAROIValidator:
         return url
 
     def _extract_domain(self, url: str) -> Optional[str]:
-        """Extract hostname (port-stripped, lowercase) from a url-ish string."""
+        """Extract hostname (port-stripped, lowercase) from a url-ish string.
+
+        Returns None for a host with no dot or longer than _MAX_HOSTNAME_LENGTH.
+        """
         if not url or not isinstance(url, str):
             return None
         url = self._normalize_url(url)
@@ -1303,7 +1347,7 @@ class ParallelAROIValidator:
             if not domain:
                 # Fallback: take first path segment if netloc was empty
                 domain = parsed.path.split('/')[0].split(':')[0].lower() if parsed.path else None
-            if domain and '.' in domain:
+            if domain and '.' in domain and len(domain) <= _MAX_HOSTNAME_LENGTH:
                 return domain
             return None
         except (ValueError, AttributeError) as e:
@@ -1366,6 +1410,12 @@ class ParallelAROIValidator:
                 if attempt < max_attempts:
                     continue
 
+            # Must precede ConnectionError, which SSLError subclasses.
+            except requests.exceptions.SSLError as e:
+                last_error = self._categorize_ssl_error(e, url, error_label)
+                last_category = 'transport_error'
+                break
+
             except requests.exceptions.ConnectionError as e:
                 error_str = str(e).lower()
                 last_category = 'transport_error'
@@ -1391,11 +1441,6 @@ class ParallelAROIValidator:
                     last_error = f"{error_label}: HTTP error connection max retries exceeded for URL: {url}"
                     break
 
-            except requests.exceptions.SSLError as e:
-                last_error = self._categorize_ssl_error(str(e), url, error_label, attempt, max_attempts)
-                last_category = 'transport_error'
-                break
-
             except requests.exceptions.HTTPError as e:
                 domain = urlparse(url).hostname or ''
                 status = e.response.status_code if e.response is not None else 0
@@ -1416,116 +1461,59 @@ class ParallelAROIValidator:
 
         return None, last_error, last_category, attempt
 
+    # OpenSSL X509_V_ERR_* codes (ssl.SSLCertVerificationError.verify_code)
+    # reworded for operators. Other codes report OpenSSL's verify_message.
+    _CERT_VERIFY_ERRORS = {
+        10: "certificate expired",
+        18: "certificate is self-signed",
+        19: "certificate chain ends in an untrusted root CA",
+        2: "certificate chain incomplete or issued by an untrusted CA",
+        20: "certificate chain incomplete or issued by an untrusted CA",
+        21: "certificate chain incomplete or issued by an untrusted CA",
+        62: "hostname mismatch, certificate is not valid",
+    }
+
     def _categorize_ssl_error(
         self,
-        error_str: str,
+        error: requests.exceptions.SSLError,
         url: str,
         error_label: str,
-        attempt: int = 1,
-        max_attempts: int = 2,
     ) -> str:
-        """Categorize SSL errors and return detailed, actionable error messages."""
-        parsed = urlparse(url)
-        hostname = parsed.hostname or ''
-        error_lower = error_str.lower()
+        """Return an actionable error message for a TLS failure.
 
-        cert_info_cache: Dict[str, Any] = {}
+        Reads the ssl.SSLError that requests and urllib3 wrap (requests
+        SSLError -> MaxRetryError -> urllib3 SSLError -> ssl.SSLError):
+        verify_code/verify_message for certificate failures, the OpenSSL
+        reason otherwise. Opens no second connection, so the certificate
+        itself (expiry date, issuer, names) is not reported.
+        """
+        hostname = urlparse(url).hostname or ''
+        cause: BaseException = error
+        for _ in range(5):  # bounded: the chain above is three wrappers deep
+            inner = getattr(cause, 'reason', None)
+            if not isinstance(inner, BaseException):
+                inner = next((a for a in cause.args if isinstance(a, BaseException)), None)
+            if inner is None:
+                break
+            cause = inner
 
-        def get_cert_info():
-            if 'data' not in cert_info_cache:
-                cert_info_cache['data'] = self._get_ssl_cert_info(hostname)
-            return cert_info_cache['data']
-
-        # (patterns, message_func) table
-        error_patterns = [
-            (['timed out', 'timeout'],
-             lambda: f"{error_label}: HTTP error connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url}"),
-            (['connection refused'],
-             lambda: f"{error_label}: HTTP error connection refused for URL: {url}"),
-            (['connection reset'],
-             lambda: f"{error_label}: HTTP error connection reset for URL: {url}"),
-            (['certificate verify failed'],
-             lambda: f"{error_label}: HTTP SSL certificate verification failed for {hostname} at URL: {url}"),
-            (['certificate has expired', 'cert_has_expired'],
-             lambda: f"{error_label}: HTTP SSL certificate expired on {get_cert_info().get('expiration', 'unknown date')} for {hostname} at URL: {url}"),
-            (['self signed certificate in certificate chain'],
-             lambda: f"{error_label}: HTTP SSL certificate chain contains self-signed cert (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
-            (['self signed certificate', 'self_signed_cert'],
-             lambda: f"{error_label}: HTTP SSL certificate is self-signed (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
-            (['unable to get local issuer'],
-             lambda: f"{error_label}: HTTP SSL certificate chain incomplete for {hostname} at URL: {url}"),
-            (['unknown ca', 'unable to get issuer'],
-             lambda: f"{error_label}: HTTP SSL unknown CA \"{get_cert_info().get('issuer_name', 'unknown')}\" for {hostname} at URL: {url}"),
-            (['sslv3_alert_handshake_failure', 'sslv3 alert handshake'],
-             lambda: f"{error_label}: HTTP SSL handshake failure due to SSLv3 handshake for {hostname} at URL: {url}"),
-            (['handshake failure', 'handshake_failure'],
-             lambda: f"{error_label}: HTTP SSL handshake failure due to older version {get_cert_info().get('tls_version', 'unknown')} for {hostname} at URL: {url}"),
-            (['unexpected_eof', 'unexpected eof'],
-             lambda: f"{error_label}: HTTP SSL error unexpected EOF for {hostname} at URL: {url}"),
-        ]
-
-        if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
-            cert_hosts = get_cert_info().get('hostnames', ['unknown'])
-            cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
-            return f"{error_label}: HTTP SSL hostname mismatch for remote {cert_hosts_str} but expected {hostname} at URL: {url}"
-
-        for patterns, message_func in error_patterns:
-            if any(p in error_lower for p in patterns):
-                return message_func()
-
-        return f"{error_label}: HTTP SSL error {error_str[:100]} for {hostname} at URL: {url}"
-
-    @staticmethod
-    def _parse_cert_field(field_data: list) -> Dict[str, str]:
-        result: Dict[str, str] = {}
-        for item in field_data:
-            if isinstance(item, tuple):
-                if len(item) == 2 and isinstance(item[0], str):
-                    result[item[0]] = item[1]
-                else:
-                    for subitem in item:
-                        if isinstance(subitem, tuple) and len(subitem) == 2:
-                            result[subitem[0]] = subitem[1]
-        return result
-
-    def _get_ssl_cert_info(self, hostname: str, port: int = 443) -> Dict[str, Any]:
-        try:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-
-            with socket.create_connection((_absolute_dns_name(hostname), port), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                    cert = ssock.getpeercert(binary_form=False)
-                    tls_version = ssock.version()
-
-                    if not cert:
-                        return {'tls_version': tls_version}
-
-                    not_after = cert.get('notAfter', '')
-                    try:
-                        exp_str = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z').strftime('%Y-%m-%d')
-                    except (ValueError, TypeError):
-                        exp_str = not_after
-
-                    issuer = self._parse_cert_field(cert.get('issuer', []))
-                    subject = self._parse_cert_field(cert.get('subject', []))
-
-                    issuer_cn = issuer.get('commonName', '')
-                    issuer_org = issuer.get('organizationName', '')
-                    cn = subject.get('commonName', '')
-                    san = [x[1] for x in cert.get('subjectAltName', []) if x[0] == 'DNS']
-
-                    return {
-                        'expiration': exp_str,
-                        'issuer_name': issuer_cn or issuer_org or 'Unknown',
-                        'common_name': cn,
-                        'subject_alt_names': san,
-                        'hostnames': list(set([cn] + san)) if cn else san,
-                        'tls_version': tls_version,
-                    }
-        except (socket.error, ssl.SSLError, OSError) as e:
-            return {'error': str(e)}
+        # "[SSL: REASON] text (_ssl.c:1029)" -> "text"
+        text = re.sub(r'^\[[^\]]*\]\s*|\s*\(_ssl\.c:\d+\)$', '', str(cause))[:100]
+        reason = getattr(cause, 'reason', None)
+        reason = reason if isinstance(reason, str) else ''
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            what = self._CERT_VERIFY_ERRORS.get(getattr(cause, 'verify_code', None)) or (
+                f"certificate verification failed ({getattr(cause, 'verify_message', None) or text})")
+        elif reason in ('UNSUPPORTED_PROTOCOL', 'TLSV1_ALERT_PROTOCOL_VERSION'):
+            # SecureTLSAdapter sets minimum_version to TLS 1.2.
+            what = "handshake failure (server does not support TLS 1.2 or newer)"
+        elif reason.endswith('HANDSHAKE_FAILURE'):
+            what = "handshake failure (server sent handshake_failure alert)"
+        elif isinstance(cause, ssl.SSLEOFError) or 'UNEXPECTED_EOF' in reason:
+            what = "error unexpected EOF"
+        else:
+            what = f"error {text}"
+        return f"{error_label}: HTTP SSL {what} for {hostname} at URL: {url}"
 
     # ------------------------------------------------------------------
     # Parallel orchestration
@@ -1872,6 +1860,30 @@ def format_migration_insights(stats: Dict, results: List[Dict]) -> str:
 # Persistence
 # ============================================================================
 
+_COMMIT_ENV_RE = re.compile(r'[0-9a-fA-F]{7,40}')
+_FULL_COMMIT_RE = re.compile(r'[0-9a-f]{40}')
+
+
+def get_code_commit() -> Optional[str]:
+    """Return the git commit of the running code, or None if unknown.
+
+    AROIVALIDATOR_COMMIT wins when it holds 7-40 hex digits, for deployments
+    without a .git directory. Otherwise ask git for HEAD of the checkout this
+    file lives in.
+    """
+    env_commit = os.environ.get('AROIVALIDATOR_COMMIT', '').strip()
+    if _COMMIT_ENV_RE.fullmatch(env_commit):
+        return env_commit.lower()
+    try:
+        head = subprocess.run(
+            ['git', '-C', str(Path(__file__).resolve().parent), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return head if _FULL_COMMIT_RE.fullmatch(head) else None
+
+
 def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     """Save validation results to JSON file."""
     results_dir = Path('validation_results').resolve()
@@ -1888,6 +1900,7 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
         'metadata': {
             'timestamp': datetime.now().isoformat(),
             'aroivalidator_schema_version': AROIVALIDATOR_SCHEMA_VERSION,
+            'code_commit': get_code_commit(),
             **{k: statistics[k] for k in ('total_relays', 'valid_relays', 'invalid_relays', 'success_rate')},
         },
         'statistics': statistics,
