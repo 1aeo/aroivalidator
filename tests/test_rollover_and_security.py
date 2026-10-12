@@ -14,12 +14,16 @@ Covers:
   - IPv4 shorthand (127.1, 0x7f.1) treated as IP literals; hosts-file-only names
   - TLS failures reported by their ssl error, not as connection errors
   - TLS SNI and the HTTP Host header keep the plain hostname
+  - Results metadata records the code commit
 """
 import io
+import json
 import socket
 import ssl
+import subprocess
 import sys
 import os.path
+import tempfile
 from unittest.mock import patch, MagicMock
 
 import requests
@@ -36,6 +40,8 @@ from aroi_validator import (
     _clear_host_safety_cache,
     _safe_create_connection,
     SSRFBlockedError,
+    get_code_commit,
+    save_results,
 )
 
 
@@ -809,6 +815,81 @@ def test_fetch_sends_plain_sni_and_host_header():
     print("  ✓ URI fetch resolves the absolute name; SNI and Host header keep the plain name")
 
 
+def test_code_commit():
+    """AROIVALIDATOR_COMMIT wins when it is 7-40 hex digits; otherwise git
+    rev-parse HEAD in the code's directory; any failure gives None.
+    Hermetic: subprocess.run is mocked."""
+    commit = '0123456789abcdef0123456789abcdef01234567'
+
+    def code_commit(env_value, **run):
+        with patch.dict(os.environ), \
+             patch('aroi_validator.subprocess.run', **run) as mock_run:
+            os.environ.pop('AROIVALIDATOR_COMMIT', None)
+            if env_value is not None:
+                os.environ['AROIVALIDATOR_COMMIT'] = env_value
+            return get_code_commit(), mock_run
+
+    git_ok = {'return_value': MagicMock(stdout=commit + '\n')}
+
+    # Env var: full or abbreviated hex, lowercased; git is not run.
+    for value, expected in ((commit.upper(), commit), (' 6e070ff\n', '6e070ff')):
+        got, mock_run = code_commit(value, **git_ok)
+        assert got == expected, (value, got)
+        assert mock_run.call_count == 0, value
+
+    # Unset or invalid env var: ask git about the checkout holding aroi_validator.py.
+    code_dir = os.path.dirname(os.path.realpath(sys.modules['aroi_validator'].__file__))
+    for value in (None, '', 'main', 'abc123', 'g' * 40, 'a' * 41):
+        got, mock_run = code_commit(value, **git_ok)
+        assert got == commit, (value, got)
+        assert mock_run.call_count == 1, value
+        assert mock_run.call_args.args[0] == ['git', '-C', code_dir, 'rev-parse', 'HEAD'], (
+            mock_run.call_args
+        )
+        assert 0 < mock_run.call_args.kwargs['timeout'] <= 10, mock_run.call_args
+
+    # Every git failure, or output that isn't a full commit, gives None.
+    failures = (
+        {'side_effect': FileNotFoundError(2, 'No such file or directory', 'git')},
+        {'side_effect': PermissionError(13, 'Permission denied', 'git')},
+        {'side_effect': subprocess.TimeoutExpired('git', 5)},
+        {'side_effect': subprocess.CalledProcessError(128, 'git')},
+        {'return_value': MagicMock(stdout='')},
+        {'return_value': MagicMock(stdout='6e070ff\n')},
+        {'return_value': MagicMock(stdout='fatal: not a git repository\n')},
+    )
+    for run in failures:
+        got, _ = code_commit(None, **run)
+        assert got is None, (run, got)
+    print("  ✓ code commit: env var wins when valid hex, else git rev-parse HEAD, else None")
+
+
+def test_save_results_records_code_commit():
+    """save_results writes metadata.code_commit, resolved once per save
+    rather than once per relay."""
+    commit = '0123456789abcdef0123456789abcdef01234567'
+    results = [
+        {'valid': True, 'proof_type': 'dns-rsa', 'ciissversion': '2'},
+        {'valid': False, 'proof_type': 'uri-familyid-ed25519', 'ciissversion': '3'},
+        {'valid': False, 'proof_type': None, 'ciissversion': None},
+    ]
+    cwd = os.getcwd()
+    with tempfile.TemporaryDirectory() as tmp:
+        os.chdir(tmp)
+        try:
+            with patch('aroi_validator.get_code_commit', return_value=commit) as mock_commit:
+                path = save_results(results, 'aroi_validation_test.json')
+            saved = json.loads(path.read_text())
+            latest = json.loads((path.parent / 'latest.json').read_text())
+        finally:
+            os.chdir(cwd)
+
+    assert mock_commit.call_count == 1, mock_commit.call_count
+    assert saved['metadata']['code_commit'] == commit, saved['metadata']
+    assert latest['metadata']['code_commit'] == commit, latest['metadata']
+    print("  ✓ save_results records metadata.code_commit, resolved once per save")
+
+
 def main():
     print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
@@ -833,6 +914,8 @@ def main():
     test_tls_failures_report_cause()
     test_non_tls_connection_errors_unchanged()
     test_fetch_sends_plain_sni_and_host_header()
+    test_code_commit()
+    test_save_results_records_code_commit()
     print("\nAll mocked-input tests passed.")
     return 0
 

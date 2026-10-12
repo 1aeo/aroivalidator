@@ -116,6 +116,7 @@ Results saved to `validation_results/` as JSON:
 {
   "metadata": {
     "timestamp": "ISO timestamp",
+    "code_commit": "git commit hash" | null,
     "total_relays": int,
     "valid_relays": int,
     "success_rate": float
@@ -124,6 +125,10 @@ Results saved to `validation_results/` as JSON:
   "results": [ ... ]
 }
 ```
+
+`code_commit` is the commit of the code that ran: `AROIVALIDATOR_COMMIT`
+when it holds 7-40 hex digits, otherwise `git rev-parse HEAD` of the
+checkout, or `null` when neither is available.
 
 ## Dependencies
 

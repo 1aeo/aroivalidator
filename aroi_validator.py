@@ -11,10 +11,12 @@ import concurrent.futures
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
 import ssl
 import string
+import subprocess
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1851,6 +1853,30 @@ def format_migration_insights(stats: Dict, results: List[Dict]) -> str:
 # Persistence
 # ============================================================================
 
+_COMMIT_ENV_RE = re.compile(r'[0-9a-fA-F]{7,40}')
+_FULL_COMMIT_RE = re.compile(r'[0-9a-f]{40}')
+
+
+def get_code_commit() -> Optional[str]:
+    """Return the git commit of the running code, or None if unknown.
+
+    AROIVALIDATOR_COMMIT wins when it holds 7-40 hex digits, for deployments
+    without a .git directory. Otherwise ask git for HEAD of the checkout this
+    file lives in.
+    """
+    env_commit = os.environ.get('AROIVALIDATOR_COMMIT', '').strip()
+    if _COMMIT_ENV_RE.fullmatch(env_commit):
+        return env_commit.lower()
+    try:
+        head = subprocess.run(
+            ['git', '-C', str(Path(__file__).resolve().parent), 'rev-parse', 'HEAD'],
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    return head if _FULL_COMMIT_RE.fullmatch(head) else None
+
+
 def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     """Save validation results to JSON file."""
     results_dir = Path('validation_results').resolve()
@@ -1867,6 +1893,7 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
         'metadata': {
             'timestamp': datetime.now().isoformat(),
             'aroivalidator_schema_version': AROIVALIDATOR_SCHEMA_VERSION,
+            'code_commit': get_code_commit(),
             **{k: statistics[k] for k in ('total_relays', 'valid_relays', 'invalid_relays', 'success_rate')},
         },
         'statistics': statistics,

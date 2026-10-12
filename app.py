@@ -445,13 +445,14 @@ def _get_validated_env_int(name: str, default: int, min_val: int, max_val: int) 
 def batch_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
     """Batch validation mode for automation"""
     from aroi_validator import (
-        run_validation, calculate_statistics, save_results
+        run_validation, calculate_statistics, save_results, get_code_commit
     )
 
     print("AROI Batch Validator (Parallel Processing)")
     print("=" * 50)
     print(f"Starting validation at {datetime.now().isoformat()}")
     print(f"Validating ciissversions: {','.join(supported_ciissversions)}")
+    print(f"Code commit: {get_code_commit() or 'unknown'}")
 
     # Configuration from environment with validation
     limit = _get_validated_env_int('BATCH_LIMIT', default=100, min_val=0, max_val=50000)
