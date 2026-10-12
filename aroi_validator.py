@@ -56,6 +56,10 @@ PROOF_TYPE_URI_FAMILYID_ED25519 = "uri-familyid-ed25519"
 # Connectivity error indicators (used for cache decisions)
 _CONNECTIVITY_ERROR_PATTERNS = ('timed out', 'connection refused', 'connection reset', 'connection error')
 
+# Longest DNS name, in characters. Longer url hosts are rejected before any
+# IDNA encoding: the idna codec's punycode step is quadratic in label length.
+_MAX_HOSTNAME_LENGTH = 253
+
 # Pre-compiled regex patterns for AROI field parsing
 _AROI_PATTERNS = {
     'ciissversion': re.compile(r'\bciissversion:(\S+)', re.IGNORECASE),
@@ -1329,7 +1333,10 @@ class ParallelAROIValidator:
         return url
 
     def _extract_domain(self, url: str) -> Optional[str]:
-        """Extract hostname (port-stripped, lowercase) from a url-ish string."""
+        """Extract hostname (port-stripped, lowercase) from a url-ish string.
+
+        Returns None for a host with no dot or longer than _MAX_HOSTNAME_LENGTH.
+        """
         if not url or not isinstance(url, str):
             return None
         url = self._normalize_url(url)
@@ -1340,7 +1347,7 @@ class ParallelAROIValidator:
             if not domain:
                 # Fallback: take first path segment if netloc was empty
                 domain = parsed.path.split('/')[0].split(':')[0].lower() if parsed.path else None
-            if domain and '.' in domain:
+            if domain and '.' in domain and len(domain) <= _MAX_HOSTNAME_LENGTH:
                 return domain
             return None
         except (ValueError, AttributeError) as e:

@@ -11,6 +11,7 @@ Covers:
   - SSRF protections (IP literals, private/loopback ranges, redirects)
   - Operator hostnames resolved as absolute names (no search-domain leak)
   - Hostnames ending in a Unicode full stop, or with an empty label, fail cleanly
+  - Hosts longer than a DNS name rejected before any IDNA encoding
   - IPv4 shorthand (127.1, 0x7f.1) treated as IP literals; hosts-file-only names
   - TLS failures reported by their ssl error, not as connection errors
   - TLS SNI and the HTTP Host header keep the plain hostname
@@ -563,6 +564,36 @@ def test_relay_with_malformed_hostname_fails_cleanly():
     print("  ✓ url ending in a Unicode full stop or with an empty label: transport_error, cache entry resolved")
 
 
+def test_overlong_hostname_rejected_before_lookup():
+    """A url host longer than a DNS name (253 characters) is invalid_url,
+    before the safety check, any lookup or fetch. Each of those IDNA-encodes
+    the host, and the codec's punycode step is quadratic in label length: a
+    5,000-character CJK host took seconds per encode, holding the GIL."""
+    v = ParallelAROIValidator(max_workers=1)
+    longest = '.'.join(['a' * 63, 'b' * 63, 'c' * 63, 'd' * 57, 'org'])
+    assert len(longest) == 253
+    assert v._extract_domain(f'https://{longest}/') == longest
+    assert v._extract_domain(f'https://e{longest}/') is None
+
+    overlong = ''.join(chr(0x4e00 + i) for i in range(5000)) + '.com'
+    for proof in ('uri-familyid-ed25519', 'dns-familyid-ed25519'):
+        _clear_host_safety_cache()
+        relay = {
+            'nickname': 'OverlongHostRelay',
+            'fingerprint': 'L' * 40,
+            'family_ids': ['fid'],
+            'contact': f'url:https://{overlong} proof:{proof} ciissversion:3',
+        }
+        with patch('aroi_validator.socket.getaddrinfo') as mock_gai, \
+             patch('aroi_validator.dns.resolver.resolve') as mock_resolve, \
+             patch.object(v, '_fetch_with_retry') as mock_fetch:
+            out = v.validate_relay(relay)
+        assert out['valid'] is False, proof
+        assert out['error_category'] == 'invalid_url', (proof, out['error_category'], out['error'][:80])
+        assert mock_gai.call_count == mock_resolve.call_count == mock_fetch.call_count == 0, proof
+    print("  ✓ url host over 253 characters: invalid_url with no lookup or fetch (uri and dns proofs)")
+
+
 def test_numeric_shorthand_is_ip_literal():
     """glibc's getaddrinfo parses every IPv4 form inet_aton accepts as an
     address: 127.1 and 0x7f.1 are 127.0.0.1, 010.0.0.1 is 8.0.0.1. They must
@@ -909,6 +940,7 @@ def main():
     test_absolute_dns_name_unicode_full_stops()
     test_malformed_hostnames_fail_cleanly()
     test_relay_with_malformed_hostname_fails_cleanly()
+    test_overlong_hostname_rejected_before_lookup()
     test_numeric_shorthand_is_ip_literal()
     test_hosts_file_only_name_not_consulted()
     test_tls_failures_report_cause()
