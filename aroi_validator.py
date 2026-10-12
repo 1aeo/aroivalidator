@@ -1401,6 +1401,12 @@ class ParallelAROIValidator:
                 if attempt < max_attempts:
                     continue
 
+            # Must precede ConnectionError, which SSLError subclasses.
+            except requests.exceptions.SSLError as e:
+                last_error = self._categorize_ssl_error(e, url, error_label)
+                last_category = 'transport_error'
+                break
+
             except requests.exceptions.ConnectionError as e:
                 error_str = str(e).lower()
                 last_category = 'transport_error'
@@ -1426,11 +1432,6 @@ class ParallelAROIValidator:
                     last_error = f"{error_label}: HTTP error connection max retries exceeded for URL: {url}"
                     break
 
-            except requests.exceptions.SSLError as e:
-                last_error = self._categorize_ssl_error(str(e), url, error_label, attempt, max_attempts)
-                last_category = 'transport_error'
-                break
-
             except requests.exceptions.HTTPError as e:
                 domain = urlparse(url).hostname or ''
                 status = e.response.status_code if e.response is not None else 0
@@ -1451,116 +1452,59 @@ class ParallelAROIValidator:
 
         return None, last_error, last_category, attempt
 
+    # OpenSSL X509_V_ERR_* codes (ssl.SSLCertVerificationError.verify_code)
+    # reworded for operators. Other codes report OpenSSL's verify_message.
+    _CERT_VERIFY_ERRORS = {
+        10: "certificate expired",
+        18: "certificate is self-signed",
+        19: "certificate chain ends in an untrusted root CA",
+        2: "certificate chain incomplete or issued by an untrusted CA",
+        20: "certificate chain incomplete or issued by an untrusted CA",
+        21: "certificate chain incomplete or issued by an untrusted CA",
+        62: "hostname mismatch, certificate is not valid",
+    }
+
     def _categorize_ssl_error(
         self,
-        error_str: str,
+        error: requests.exceptions.SSLError,
         url: str,
         error_label: str,
-        attempt: int = 1,
-        max_attempts: int = 2,
     ) -> str:
-        """Categorize SSL errors and return detailed, actionable error messages."""
-        parsed = urlparse(url)
-        hostname = parsed.hostname or ''
-        error_lower = error_str.lower()
+        """Return an actionable error message for a TLS failure.
 
-        cert_info_cache: Dict[str, Any] = {}
+        Reads the ssl.SSLError that requests and urllib3 wrap (requests
+        SSLError -> MaxRetryError -> urllib3 SSLError -> ssl.SSLError):
+        verify_code/verify_message for certificate failures, the OpenSSL
+        reason otherwise. Opens no second connection, so the certificate
+        itself (expiry date, issuer, names) is not reported.
+        """
+        hostname = urlparse(url).hostname or ''
+        cause: BaseException = error
+        for _ in range(5):  # bounded: the chain above is three wrappers deep
+            inner = getattr(cause, 'reason', None)
+            if not isinstance(inner, BaseException):
+                inner = next((a for a in cause.args if isinstance(a, BaseException)), None)
+            if inner is None:
+                break
+            cause = inner
 
-        def get_cert_info():
-            if 'data' not in cert_info_cache:
-                cert_info_cache['data'] = self._get_ssl_cert_info(hostname)
-            return cert_info_cache['data']
-
-        # (patterns, message_func) table
-        error_patterns = [
-            (['timed out', 'timeout'],
-             lambda: f"{error_label}: HTTP error connection timed out after {DEFAULT_TIMEOUT_SECONDS}s for URL: {url}"),
-            (['connection refused'],
-             lambda: f"{error_label}: HTTP error connection refused for URL: {url}"),
-            (['connection reset'],
-             lambda: f"{error_label}: HTTP error connection reset for URL: {url}"),
-            (['certificate verify failed'],
-             lambda: f"{error_label}: HTTP SSL certificate verification failed for {hostname} at URL: {url}"),
-            (['certificate has expired', 'cert_has_expired'],
-             lambda: f"{error_label}: HTTP SSL certificate expired on {get_cert_info().get('expiration', 'unknown date')} for {hostname} at URL: {url}"),
-            (['self signed certificate in certificate chain'],
-             lambda: f"{error_label}: HTTP SSL certificate chain contains self-signed cert (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
-            (['self signed certificate', 'self_signed_cert'],
-             lambda: f"{error_label}: HTTP SSL certificate is self-signed (issuer: {get_cert_info().get('issuer_name', 'unknown')}) for {hostname} at URL: {url}"),
-            (['unable to get local issuer'],
-             lambda: f"{error_label}: HTTP SSL certificate chain incomplete for {hostname} at URL: {url}"),
-            (['unknown ca', 'unable to get issuer'],
-             lambda: f"{error_label}: HTTP SSL unknown CA \"{get_cert_info().get('issuer_name', 'unknown')}\" for {hostname} at URL: {url}"),
-            (['sslv3_alert_handshake_failure', 'sslv3 alert handshake'],
-             lambda: f"{error_label}: HTTP SSL handshake failure due to SSLv3 handshake for {hostname} at URL: {url}"),
-            (['handshake failure', 'handshake_failure'],
-             lambda: f"{error_label}: HTTP SSL handshake failure due to older version {get_cert_info().get('tls_version', 'unknown')} for {hostname} at URL: {url}"),
-            (['unexpected_eof', 'unexpected eof'],
-             lambda: f"{error_label}: HTTP SSL error unexpected EOF for {hostname} at URL: {url}"),
-        ]
-
-        if 'hostname' in error_lower and ('mismatch' in error_lower or "doesn't match" in error_lower):
-            cert_hosts = get_cert_info().get('hostnames', ['unknown'])
-            cert_hosts_str = ', '.join(cert_hosts) if cert_hosts else 'unknown'
-            return f"{error_label}: HTTP SSL hostname mismatch for remote {cert_hosts_str} but expected {hostname} at URL: {url}"
-
-        for patterns, message_func in error_patterns:
-            if any(p in error_lower for p in patterns):
-                return message_func()
-
-        return f"{error_label}: HTTP SSL error {error_str[:100]} for {hostname} at URL: {url}"
-
-    @staticmethod
-    def _parse_cert_field(field_data: list) -> Dict[str, str]:
-        result: Dict[str, str] = {}
-        for item in field_data:
-            if isinstance(item, tuple):
-                if len(item) == 2 and isinstance(item[0], str):
-                    result[item[0]] = item[1]
-                else:
-                    for subitem in item:
-                        if isinstance(subitem, tuple) and len(subitem) == 2:
-                            result[subitem[0]] = subitem[1]
-        return result
-
-    def _get_ssl_cert_info(self, hostname: str, port: int = 443) -> Dict[str, Any]:
-        try:
-            context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
-
-            with socket.create_connection((_absolute_dns_name(hostname), port), timeout=5) as sock:
-                with context.wrap_socket(sock, server_hostname=hostname) as ssock:
-                    cert = ssock.getpeercert(binary_form=False)
-                    tls_version = ssock.version()
-
-                    if not cert:
-                        return {'tls_version': tls_version}
-
-                    not_after = cert.get('notAfter', '')
-                    try:
-                        exp_str = datetime.strptime(not_after, '%b %d %H:%M:%S %Y %Z').strftime('%Y-%m-%d')
-                    except (ValueError, TypeError):
-                        exp_str = not_after
-
-                    issuer = self._parse_cert_field(cert.get('issuer', []))
-                    subject = self._parse_cert_field(cert.get('subject', []))
-
-                    issuer_cn = issuer.get('commonName', '')
-                    issuer_org = issuer.get('organizationName', '')
-                    cn = subject.get('commonName', '')
-                    san = [x[1] for x in cert.get('subjectAltName', []) if x[0] == 'DNS']
-
-                    return {
-                        'expiration': exp_str,
-                        'issuer_name': issuer_cn or issuer_org or 'Unknown',
-                        'common_name': cn,
-                        'subject_alt_names': san,
-                        'hostnames': list(set([cn] + san)) if cn else san,
-                        'tls_version': tls_version,
-                    }
-        except (socket.error, ssl.SSLError, OSError, UnicodeError) as e:
-            return {'error': str(e)}
+        # "[SSL: REASON] text (_ssl.c:1029)" -> "text"
+        text = re.sub(r'^\[[^\]]*\]\s*|\s*\(_ssl\.c:\d+\)$', '', str(cause))[:100]
+        reason = getattr(cause, 'reason', None)
+        reason = reason if isinstance(reason, str) else ''
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            what = self._CERT_VERIFY_ERRORS.get(getattr(cause, 'verify_code', None)) or (
+                f"certificate verification failed ({getattr(cause, 'verify_message', None) or text})")
+        elif reason in ('UNSUPPORTED_PROTOCOL', 'TLSV1_ALERT_PROTOCOL_VERSION'):
+            # SecureTLSAdapter sets minimum_version to TLS 1.2.
+            what = "handshake failure (server does not support TLS 1.2 or newer)"
+        elif reason.endswith('HANDSHAKE_FAILURE'):
+            what = "handshake failure (server sent handshake_failure alert)"
+        elif isinstance(cause, ssl.SSLEOFError) or 'UNEXPECTED_EOF' in reason:
+            what = "error unexpected EOF"
+        else:
+            what = f"error {text}"
+        return f"{error_label}: HTTP SSL {what} for {hostname} at URL: {url}"
 
     # ------------------------------------------------------------------
     # Parallel orchestration

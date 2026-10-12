@@ -12,11 +12,16 @@ Covers:
   - Operator hostnames resolved as absolute names (no search-domain leak)
   - Hostnames ending in a Unicode full stop, or with an empty label, fail cleanly
   - IPv4 shorthand (127.1, 0x7f.1) treated as IP literals; hosts-file-only names
+  - TLS failures reported by their ssl error, not as connection errors
 """
 import socket
+import ssl
 import sys
 import os.path
 from unittest.mock import patch, MagicMock
+
+import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError, SSLError as Urllib3SSLError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -434,9 +439,8 @@ def test_operator_hosts_resolved_without_search_domain():
     retries it with the validator host's search domain appended
     (www.<domain> -> www.<domain>.<search-domain>), leaking it to that zone.
 
-    Drives the www-fallback flow through the real requests/urllib3 stack,
-    plus the TLS-certificate diagnostic. Hermetic: getaddrinfo is mocked to
-    fail every lookup.
+    Drives the www-fallback flow through the real requests/urllib3 stack.
+    Hermetic: getaddrinfo is mocked to fail every lookup.
     """
     _clear_host_safety_cache()
     v = ParallelAROIValidator(max_workers=1)
@@ -456,17 +460,15 @@ def test_operator_hosts_resolved_without_search_domain():
 
     with patch('aroi_validator.socket.getaddrinfo', side_effect=failing_getaddrinfo):
         out = v.validate_relay(relay)
-        cert_info = v._get_ssl_cert_info('www.operator.invalid')
 
     assert set(looked_up) == {'operator.invalid.', 'www.operator.invalid.'}, (
         f"resolver must only see absolute names; got {looked_up}"
     )
-    assert 'error' in cert_info, cert_info
     # The fetch URLs and error messages keep the plain hostname.
     assert out['valid'] is False, out
     assert 'https://www.operator.invalid/.well-known/' in out['error'], out
     assert 'operator.invalid.' not in out['error'], out
-    print("  ✓ safety check, connect and TLS-cert lookups all use absolute names; messages keep plain names")
+    print("  ✓ safety check and connect lookups use absolute names; messages keep plain names")
 
 
 UNICODE_FULL_STOPS = ('\u3002', '\uff0e', '\uff61')
@@ -498,9 +500,8 @@ def test_absolute_dns_name_unicode_full_stops():
 
 def test_malformed_hostnames_fail_cleanly():
     """Names the idna codec rejects (empty or over-long label) must not raise
-    UnicodeError out of the safety check, the connect or the TLS-cert lookup."""
+    UnicodeError out of the safety check or the connect."""
     _clear_host_safety_cache()
-    v = ParallelAROIValidator(max_workers=1)
     names = [
         'operator..invalid', '.operator.invalid', 'operator.invalid..',
         'a' * 64 + '.invalid',
@@ -515,9 +516,7 @@ def test_malformed_hostnames_fail_cleanly():
                 raise AssertionError(f"{name!r}: connect should fail")
             except socket.gaierror:
                 pass  # urllib3 reports it as a NameResolutionError
-            cert_info = v._get_ssl_cert_info(name)
-            assert 'error' in cert_info, (name, cert_info)
-    print("  ✓ empty/over-long labels: safety check, connect and TLS-cert lookup fail without UnicodeError")
+    print("  ✓ empty/over-long labels: safety check and connect fail without UnicodeError")
 
 
 def test_relay_with_malformed_hostname_fails_cleanly():
@@ -647,6 +646,105 @@ def test_hosts_file_only_name_not_consulted():
     print("  ✓ hosts-file-only name: not consulted, fails closed as transport_error, no connection")
 
 
+def _requests_error(exc_cls, cause):
+    """Wrap cause the way requests raises a failed connect/handshake:
+    requests error -> MaxRetryError -> urllib3 error -> cause."""
+    if isinstance(cause, ssl.SSLError):
+        cause = Urllib3SSLError(cause)
+    return exc_cls(MaxRetryError(None, '/.well-known/tor-relay/rsa-fingerprint.txt', cause))
+
+
+def _ssl_error(cls, reason, text, verify_code=None, verify_message=None):
+    """ssl exception with the attributes _ssl sets on a real one."""
+    e = cls(1, f"[SSL: {reason}] {text} (_ssl.c:1029)")
+    e.reason, e.library = reason, 'SSL'
+    if verify_code is not None:
+        e.verify_code, e.verify_message = verify_code, verify_message
+    return e
+
+
+def _cert_error(verify_code, verify_message):
+    return _ssl_error(
+        ssl.SSLCertVerificationError, 'CERTIFICATE_VERIFY_FAILED',
+        f"certificate verify failed: {verify_message}", verify_code, verify_message)
+
+
+def _fetch_failure(exc):
+    """validate_relay for a uri-rsa relay whose every fetch raises exc.
+    Returns (result, session.get call count). The pre-flight resolves to a
+    public address; socket.create_connection is a tripwire for any second
+    connection opened to describe the failure."""
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    relay = {
+        'nickname': 'TLSRelay',
+        'fingerprint': 'K' * 40,
+        'contact': 'url:tls.invalid proof:uri-rsa ciissversion:2',
+    }
+    public = [(socket.AF_INET, socket.SOCK_STREAM, 0, '', ('93.184.216.34', 0))]
+    with patch('aroi_validator.socket.getaddrinfo', return_value=public), \
+         patch('aroi_validator.socket.create_connection') as tripwire, \
+         patch.object(v.session, 'get', side_effect=exc) as mock_get:
+        out = v.validate_relay(relay)
+    assert tripwire.call_count == 0, "TLS failure must not open a second connection"
+    return out, mock_get.call_count
+
+
+def test_tls_failures_report_cause():
+    """requests.SSLError subclasses ConnectionError, so it must be caught
+    first; otherwise every TLS failure reads 'connection max retries
+    exceeded'. The message comes from the wrapped ssl error. The category
+    stays transport_error and the www-fallback is still tried, as before."""
+    url = 'https://tls.invalid/.well-known/tor-relay/rsa-fingerprint.txt'
+    cases = [
+        (_cert_error(10, 'certificate has expired'),
+         "HTTP SSL certificate expired for tls.invalid at URL: " + url),
+        (_cert_error(18, 'self-signed certificate'),
+         "HTTP SSL certificate is self-signed for tls.invalid at URL: " + url),
+        (_cert_error(62, "Hostname mismatch, certificate is not valid for 'tls.invalid'."),
+         "HTTP SSL hostname mismatch, certificate is not valid for tls.invalid at URL: " + url),
+        (_cert_error(20, 'unable to get local issuer certificate'),
+         "HTTP SSL certificate chain incomplete or issued by an untrusted CA for tls.invalid"),
+        (_cert_error(19, 'self-signed certificate in certificate chain'),
+         "HTTP SSL certificate chain ends in an untrusted root CA for tls.invalid"),
+        (_cert_error(9, 'certificate is not yet valid'),
+         "HTTP SSL certificate verification failed (certificate is not yet valid) for tls.invalid"),
+        (_ssl_error(ssl.SSLError, 'SSLV3_ALERT_HANDSHAKE_FAILURE', 'ssl/tls alert handshake failure'),
+         "HTTP SSL handshake failure (server sent handshake_failure alert) for tls.invalid"),
+        (_ssl_error(ssl.SSLError, 'UNSUPPORTED_PROTOCOL', 'unsupported protocol'),
+         "HTTP SSL handshake failure (server does not support TLS 1.2 or newer) for tls.invalid"),
+        (_ssl_error(ssl.SSLEOFError, 'UNEXPECTED_EOF_WHILE_READING', 'EOF occurred in violation of protocol'),
+         "HTTP SSL error unexpected EOF for tls.invalid"),
+        (_ssl_error(ssl.SSLError, 'BAD_DH_VALUE', 'bad dh value'),
+         "HTTP SSL error bad dh value for tls.invalid at URL: " + url),
+    ]
+    for cause, expected in cases:
+        out, calls = _fetch_failure(_requests_error(requests.exceptions.SSLError, cause))
+        assert out['valid'] is False, out
+        assert out['error_category'] == 'transport_error', out
+        assert out['error'].startswith('URI-RSA: ' + expected), (expected, out['error'])
+        assert calls == 2, f"www-fallback should still be tried after a TLS failure ({calls} fetches)"
+        assert 'www.tls.invalid at URL' in out['error'], out['error']
+        assert 'max retries' not in out['error'] and '_ssl.c' not in out['error'], out['error']
+    print(f"  ✓ TLS failures: {len(cases)} ssl error variants reported by cause, transport_error, www-fallback kept, no second connection")
+
+
+def test_non_tls_connection_errors_unchanged():
+    """Connection errors that are not TLS failures keep their messages and
+    the connectivity rule for skipping the www-fallback."""
+    url = 'https://tls.invalid/.well-known/tor-relay/rsa-fingerprint.txt'
+    refused = NewConnectionError(None, 'Failed to establish a new connection: [Errno 111] Connection refused')
+    out, calls = _fetch_failure(_requests_error(requests.exceptions.ConnectionError, refused))
+    assert out['error'] == f"URI-RSA: HTTP error connection refused for URL: {url}", out['error']
+    assert out['error_category'] == 'transport_error' and calls == 1, (out, calls)
+
+    unreachable = NewConnectionError(None, 'Failed to establish a new connection: [Errno 101] Network is unreachable')
+    out, calls = _fetch_failure(_requests_error(requests.exceptions.ConnectionError, unreachable))
+    assert out['error'].startswith(f"URI-RSA: HTTP error connection max retries exceeded for URL: {url}; "), out['error']
+    assert out['error_category'] == 'transport_error' and calls == 2, (out, calls)
+    print("  ✓ non-TLS connection errors: messages, category and www-fallback rule unchanged")
+
+
 def main():
     print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
@@ -668,6 +766,8 @@ def main():
     test_relay_with_malformed_hostname_fails_cleanly()
     test_numeric_shorthand_is_ip_literal()
     test_hosts_file_only_name_not_consulted()
+    test_tls_failures_report_cause()
+    test_non_tls_connection_errors_unchanged()
     print("\nAll mocked-input tests passed.")
     return 0
 
