@@ -703,6 +703,8 @@ def _ssl_error(cls, reason, text, verify_code=None, verify_message=None):
 
 
 def _cert_error(verify_code, verify_message):
+    """ssl.SSLCertVerificationError for an X509 verify failure, as _ssl
+    raises it: reason CERTIFICATE_VERIFY_FAILED plus verify_code/message."""
     return _ssl_error(
         ssl.SSLCertVerificationError, 'CERTIFICATE_VERIFY_FAILED',
         f"certificate verify failed: {verify_message}", verify_code, verify_message)
@@ -853,6 +855,9 @@ def test_code_commit():
     commit = '0123456789abcdef0123456789abcdef01234567'
 
     def code_commit(env_value, **run):
+        """get_code_commit() with AROIVALIDATOR_COMMIT set to env_value
+        (unset if None) and subprocess.run patched with run; returns the
+        result and the subprocess.run mock."""
         with patch.dict(os.environ), \
              patch('aroi_validator.subprocess.run', **run) as mock_run:
             os.environ.pop('AROIVALIDATOR_COMMIT', None)
@@ -922,6 +927,7 @@ def test_save_results_records_code_commit():
 
 
 def main():
+    """Run every test in order; an assertion failure stops the run."""
     print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
     test_secret_key_leak_dns()
