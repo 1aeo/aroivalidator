@@ -13,7 +13,9 @@ Covers:
   - Hostnames ending in a Unicode full stop, or with an empty label, fail cleanly
   - IPv4 shorthand (127.1, 0x7f.1) treated as IP literals; hosts-file-only names
   - TLS failures reported by their ssl error, not as connection errors
+  - TLS SNI and the HTTP Host header keep the plain hostname
 """
+import io
 import socket
 import ssl
 import sys
@@ -745,6 +747,68 @@ def test_non_tls_connection_errors_unchanged():
     print("  ✓ non-TLS connection errors: messages, category and www-fallback rule unchanged")
 
 
+def test_fetch_sends_plain_sni_and_host_header():
+    """A URI-proof fetch through the validator's session (SecureTLSAdapter ->
+    SSRF-safe urllib3 connection -> _safe_create_connection) resolves the
+    absolute name, but sends the plain hostname as TLS SNI and HTTP Host.
+    urllib3 2.x strips the dot from both; this catches code of ours that adds it back.
+
+    Hermetic: getaddrinfo returns a public IP, the TCP socket and the TLS
+    handshake are mocked, and the mocked TLS socket replays a canned HTTP
+    response that holds the relay's family ID.
+    """
+    _clear_host_safety_cache()
+    v = ParallelAROIValidator(max_workers=1)
+    # Environment proxies would route the fetch around _safe_create_connection.
+    v.session.trust_env = False
+    family_id = 'the_legitimate_public_family_id_value___'
+    relay = {
+        'nickname': 'PlainSNIRelay',
+        'fingerprint': 'K' * 40,
+        'family_ids': [family_id],
+        'contact': 'url:operator.invalid proof:uri-familyid-ed25519 ciissversion:3',
+    }
+    looked_up = []
+    sni = []
+    sent = []
+
+    def public_getaddrinfo(host, *args, **kwargs):
+        looked_up.append(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.216.34', 443))]
+
+    body = (family_id + '\n').encode()
+    tls_sock = MagicMock()
+    tls_sock.sendall.side_effect = sent.append
+    tls_sock.makefile.return_value = io.BytesIO(
+        b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n'
+        b'Content-Length: %d\r\n\r\n%s' % (len(body), body)
+    )
+
+    def fake_wrap_socket(self, sock, server_hostname=None, **kwargs):
+        sni.append(server_hostname)
+        return tls_sock
+
+    with patch('aroi_validator.socket.getaddrinfo', side_effect=public_getaddrinfo), \
+         patch('aroi_validator.socket.socket', return_value=MagicMock()), \
+         patch.object(ssl.SSLContext, 'wrap_socket', fake_wrap_socket):
+        out = v.validate_relay(relay)
+    _clear_host_safety_cache()
+
+    assert out['valid'] is True, out
+    assert set(looked_up) == {'operator.invalid.'}, (
+        f"resolver must only see absolute names; got {looked_up}"
+    )
+    assert sni == ['operator.invalid'], f"SNI must be the plain hostname; got {sni}"
+    request = b''.join(sent)
+    host_headers = [
+        line for line in request.split(b'\r\n') if line.lower().startswith(b'host:')
+    ]
+    assert host_headers == [b'Host: operator.invalid'], (
+        f"Host header must be the plain hostname; got {host_headers}"
+    )
+    print("  ✓ URI fetch resolves the absolute name; SNI and Host header keep the plain name")
+
+
 def main():
     print("Running ciissversion:3 mocked-input tests...")
     test_rollover()
@@ -768,6 +832,7 @@ def main():
     test_hosts_file_only_name_not_consulted()
     test_tls_failures_report_cause()
     test_non_tls_connection_errors_unchanged()
+    test_fetch_sends_plain_sni_and_host_header()
     print("\nAll mocked-input tests passed.")
     return 0
 
