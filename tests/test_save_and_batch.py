@@ -84,6 +84,24 @@ class TestAtomicSaveResults(unittest.TestCase):
             finally:
                 os.umask(old_umask)
 
+    def test_atomic_write_without_os_fchmod_updates_existing_file(self):
+        """When os.fchmod is unavailable (e.g. Windows), replacing still succeeds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / 'latest.json'
+            dest.write_text('{"old": true}', encoding='utf-8')
+
+            orig_fchmod = getattr(os, 'fchmod', None)
+            if orig_fchmod is not None:
+                delattr(os, 'fchmod')
+            try:
+                _atomic_write_text(dest, '{"new": true}')
+            finally:
+                if orig_fchmod is not None:
+                    setattr(os, 'fchmod', orig_fchmod)
+
+            self.assertEqual(dest.read_text(encoding='utf-8'), '{"new": true}')
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ['latest.json'])
+
     def test_atomic_write_preserves_existing_file_on_write_error(self):
         """A simulated ENOSPC during write cleans up tmp file and keeps target intact."""
         with tempfile.TemporaryDirectory() as tmp:

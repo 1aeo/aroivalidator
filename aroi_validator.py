@@ -1889,10 +1889,14 @@ def get_code_commit() -> Optional[str]:
 def _atomic_write_text(dest: Path, content: str) -> None:
     """Atomically write UTF-8 text to *dest* via a same-directory temp file.
 
-    For an existing regular destination file, preserves its permission mode
-    (using descriptor-based ``os.fchmod``). For a new file, creates it with
-    ``0o644`` masked by the process umask. Flushes and fsyncs before replacing
-    *dest*, and cleans up the temporary file on any failure.
+    Uses ``lstat()`` and atomically replaces *dest* (including a destination
+    symlink) via ``os.replace()`` rather than following symlinks, keeping
+    writes contained to the destination directory. For an existing regular
+    destination file on platforms providing ``os.fchmod``, creates the temp
+    file owner-only (``0o600``) and restores the destination mode before
+    replacement. For a new file (or where ``os.fchmod`` is unavailable), opens
+    with ``0o644`` masked by the process umask. Flushes and fsyncs before
+    replacing *dest*, and cleans up the temporary file on any failure.
     """
     existing_mode: Optional[int] = None
     try:
@@ -1902,13 +1906,14 @@ def _atomic_write_text(dest: Path, content: str) -> None:
     except FileNotFoundError:
         pass
 
+    can_fchmod = hasattr(os, 'fchmod')
     tmp_path: Optional[Path] = None
     fd: Optional[int] = None
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         # Keep replacements strictly owner-only (0o600) until fchmod restores
         # existing_mode; new files inherit 0o644 & ~umask directly from open().
-        open_mode = 0o644 if existing_mode is None else 0o600
+        open_mode = 0o600 if (existing_mode is not None and can_fchmod) else 0o644
         for _ in range(100):
             candidate = dest.parent / f'.aroi-{secrets.token_hex(6)}.tmp'
             try:
@@ -1925,7 +1930,7 @@ def _atomic_write_text(dest: Path, content: str) -> None:
             tmp.write(content)
             tmp.flush()
             os.fsync(tmp.fileno())
-            if existing_mode is not None:
+            if existing_mode is not None and can_fchmod:
                 os.fchmod(tmp.fileno(), existing_mode & 0o777)
         os.replace(tmp_path, dest)
     except Exception:
