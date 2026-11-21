@@ -104,6 +104,22 @@ class TestAtomicSaveResults(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
+    def test_save_results_supports_long_filenames_near_name_max(self):
+        """Filenames near the 255-byte filesystem limit succeed without ENAMETOOLONG."""
+        long_name = ('a' * 245) + '.json'  # 250 bytes, accepted by _sanitize_filename
+        results = [{'nickname': 'Relay1', 'valid': True, 'proof_type': 'dns-rsa', 'ciissversion': '2'}]
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                with patch('aroi_validator.get_code_commit', return_value=None):
+                    out_path = save_results(results, long_name)
+                self.assertTrue(out_path.exists())
+                self.assertEqual(out_path.name, long_name)
+                self.assertEqual(json.loads(out_path.read_text(encoding='utf-8'))['metadata']['total_relays'], 1)
+            finally:
+                os.chdir(cwd)
+
 
 class TestQuietBatchMode(unittest.TestCase):
     """Verify --quiet and BATCH_QUIET behavior in aroi_cli and app."""

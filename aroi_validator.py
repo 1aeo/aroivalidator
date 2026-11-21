@@ -1898,7 +1898,7 @@ def _atomic_write_text(dest: Path, content: str) -> None:
             mode='w',
             encoding='utf-8',
             dir=dest.parent,
-            prefix=f'.{dest.name}.',
+            prefix='.aroi-',
             suffix='.tmp',
             delete=False,
         ) as tmp:
