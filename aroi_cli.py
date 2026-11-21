@@ -12,11 +12,13 @@ Modes:
 Flags:
   --ciiss-versions <list>   Comma-separated CIISS versions to validate
                             (default: 2,3). Affects interactive/batch modes.
+  -q, --quiet               Suppress per-relay progress lines in batch mode.
 
 Environment (batch mode):
   BATCH_LIMIT       Max relays to validate (default: 100)
   PARALLEL          Use parallel processing (default: true)
   MAX_WORKERS       Number of worker threads (default: 10)
+  BATCH_QUIET       Suppress per-relay progress lines when true/1/yes/on.
   CIISS_VERSIONS    Fallback for --ciiss-versions when flag absent.
 """
 import os.path
@@ -61,6 +63,15 @@ Examples:
         default=None,
         help='Comma-separated CIISS versions to validate (default: 2,3). '
              'Falls back to CIISS_VERSIONS env var if unset.',
+    )
+
+    parser.add_argument(
+        '-q',
+        '--quiet',
+        action='store_true',
+        default=False,
+        help='Suppress per-relay progress lines in batch mode. '
+             'Falls back to BATCH_QUIET env var if unset.',
     )
 
     parser.add_argument(
@@ -129,6 +140,11 @@ def main():
             f"for mode={args.mode!r} (only 'insights' accepts a file path)"
         )
 
+    if args.quiet and args.mode != 'batch':
+        parser.error(
+            f"--quiet is only supported in 'batch' mode (got mode={args.mode!r})"
+        )
+
     if args.mode == 'insights':
         sys.exit(_run_insights(args.insights_file))
 
@@ -141,6 +157,8 @@ def main():
     forwarded_args = []
     if args.ciiss_versions is not None:
         forwarded_args += ['--ciiss-versions', args.ciiss_versions]
+    if args.quiet:
+        forwarded_args.append('--quiet')
 
     if args.mode == 'batch':
         # Propagate child exit code so cron / CI / aroivalidator-deploy can

@@ -8,13 +8,16 @@ CIISS spec: https://nusenu.github.io/ContactInfo-Information-Sharing-Specificati
                    (verifies operator's ed25519 family ID against relay.family_ids)
 """
 import concurrent.futures
+import errno
 import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import socket
 import ssl
+import stat
 import string
 import subprocess
 import threading
@@ -1884,6 +1887,114 @@ def get_code_commit() -> Optional[str]:
     return head if _FULL_COMMIT_RE.fullmatch(head) else None
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Flush *directory* entry updates after ``os.replace`` where supported."""
+    if not hasattr(os, 'O_RDONLY'):
+        return
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+    unsupported_open = tuple(
+        err for err in (
+            getattr(errno, 'EINVAL', None),
+            getattr(errno, 'EISDIR', None),
+            getattr(errno, 'ENOTSUP', None),
+            getattr(errno, 'EOPNOTSUPP', None),
+            getattr(errno, 'ENOSYS', None),
+            getattr(errno, 'EACCES', None) if os.name == 'nt' else None,
+        )
+        if err is not None
+    )
+    try:
+        dir_fd = os.open(directory, flags)
+    except OSError as exc:
+        if exc.errno in unsupported_open:
+            return
+        raise
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        unsupported_sync = tuple(
+            err for err in (
+                getattr(errno, 'EINVAL', None),
+                getattr(errno, 'EBADF', None),
+                getattr(errno, 'EACCES', None),
+                getattr(errno, 'ENOTSUP', None),
+                getattr(errno, 'EOPNOTSUPP', None),
+                getattr(errno, 'ENOSYS', None),
+                getattr(errno, 'EROFS', None),
+            )
+            if err is not None
+        )
+        if exc.errno not in unsupported_sync:
+            raise
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
+def _atomic_write_text(dest: Path, content: str) -> None:
+    """Atomically write UTF-8 text to *dest* via a same-directory temp file.
+
+    Uses ``lstat()`` and atomically replaces *dest* (including a destination
+    symlink) via ``os.replace()`` rather than following symlinks, keeping
+    writes contained to the destination directory. For an existing regular
+    destination file on platforms providing ``os.fchmod``, creates the temp
+    file owner-only (``0o600``) and restores the destination mode before
+    replacement. For a new file (or where ``os.fchmod`` is unavailable), opens
+    with ``0o644`` masked by the process umask. Flushes and fsyncs before
+    replacing *dest*, and cleans up the temporary file on any failure.
+    """
+    existing_mode: Optional[int] = None
+    try:
+        st = dest.lstat()
+        if stat.S_ISREG(st.st_mode):
+            existing_mode = stat.S_IMODE(st.st_mode)
+    except FileNotFoundError:
+        pass
+
+    can_fchmod = hasattr(os, 'fchmod')
+    tmp_path: Optional[Path] = None
+    fd: Optional[int] = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        # Keep replacements strictly owner-only (0o600) until fchmod restores
+        # existing_mode; new files inherit 0o644 & ~umask directly from open().
+        open_mode = 0o600 if (existing_mode is not None and can_fchmod) else 0o644
+        for _ in range(100):
+            candidate = dest.parent / f'.aroi-{secrets.token_hex(6)}.tmp'
+            try:
+                fd = os.open(candidate, flags, open_mode)
+                tmp_path = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(f"Could not allocate temporary file in {dest.parent}")
+
+        with os.fdopen(fd, 'w', encoding='utf-8') as tmp:
+            fd = None  # ownership transferred to file wrapper
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            if existing_mode is not None and can_fchmod:
+                os.fchmod(tmp.fileno(), existing_mode & 0o777)
+        os.replace(tmp_path, dest)
+    except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    _fsync_directory(dest.parent)
+
+
 def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     """Save validation results to JSON file."""
     results_dir = Path('validation_results').resolve()
@@ -1910,8 +2021,10 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     file_path = results_dir / filename
     json_content = json.dumps(output_data, indent=2)
 
-    file_path.write_text(json_content)
-    (results_dir / 'latest.json').write_text(json_content)
+    _atomic_write_text(file_path, json_content)
+    latest_path = results_dir / 'latest.json'
+    if file_path != latest_path:
+        _atomic_write_text(latest_path, json_content)
 
     return file_path
 
