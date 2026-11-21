@@ -1906,10 +1906,13 @@ def _atomic_write_text(dest: Path, content: str) -> None:
     fd: Optional[int] = None
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        # Keep replacements strictly owner-only (0o600) until fchmod restores
+        # existing_mode; new files inherit 0o644 & ~umask directly from open().
+        open_mode = 0o644 if existing_mode is None else 0o600
         for _ in range(100):
             candidate = dest.parent / f'.aroi-{secrets.token_hex(6)}.tmp'
             try:
-                fd = os.open(candidate, flags, 0o644)
+                fd = os.open(candidate, flags, open_mode)
                 tmp_path = candidate
                 break
             except FileExistsError:
@@ -1923,7 +1926,7 @@ def _atomic_write_text(dest: Path, content: str) -> None:
             tmp.flush()
             os.fsync(tmp.fileno())
             if existing_mode is not None:
-                os.fchmod(tmp.fileno(), existing_mode)
+                os.fchmod(tmp.fileno(), existing_mode & 0o777)
         os.replace(tmp_path, dest)
     except Exception:
         if fd is not None:

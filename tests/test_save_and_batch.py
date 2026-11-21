@@ -57,15 +57,24 @@ class TestAtomicSaveResults(unittest.TestCase):
                 os.chdir(cwd)
 
     def test_atomic_write_preserves_existing_mode_and_honors_restrictive_umask(self):
-        """Existing restrictive mode (0600) is preserved; new files honor umask."""
+        """Existing restrictive mode (0600) is preserved; temp inode is never broader."""
         with tempfile.TemporaryDirectory() as tmp:
             dest_existing = Path(tmp) / 'latest.json'
             dest_existing.write_text('{"old": true}', encoding='utf-8')
             os.chmod(dest_existing, 0o600)
 
             old_umask = os.umask(0o022)
+            seen_pre_fchmod_modes = []
+            real_fchmod = os.fchmod
+
+            def spy_fchmod(fd, mode):
+                seen_pre_fchmod_modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+                return real_fchmod(fd, mode)
+
             try:
-                _atomic_write_text(dest_existing, '{"new": true}')
+                with patch('aroi_validator.os.fchmod', side_effect=spy_fchmod):
+                    _atomic_write_text(dest_existing, '{"new": true}')
+                self.assertEqual(seen_pre_fchmod_modes, [0o600])
                 self.assertEqual(stat.S_IMODE(dest_existing.stat().st_mode), 0o600)
 
                 os.umask(0o077)
