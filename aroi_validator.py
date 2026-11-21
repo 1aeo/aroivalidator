@@ -8,6 +8,7 @@ CIISS spec: https://nusenu.github.io/ContactInfo-Information-Sharing-Specificati
                    (verifies operator's ed25519 family ID against relay.family_ids)
 """
 import concurrent.futures
+import errno
 import ipaddress
 import json
 import logging
@@ -1886,6 +1887,38 @@ def get_code_commit() -> Optional[str]:
     return head if _FULL_COMMIT_RE.fullmatch(head) else None
 
 
+def _fsync_directory(directory: Path) -> None:
+    """Flush *directory* entry updates after ``os.replace`` where supported."""
+    if not hasattr(os, 'O_RDONLY'):
+        return
+    flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+    try:
+        dir_fd = os.open(directory, flags)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        unsupported = tuple(
+            err for err in (
+                getattr(errno, 'EINVAL', None),
+                getattr(errno, 'EBADF', None),
+                getattr(errno, 'EACCES', None),
+                getattr(errno, 'ENOTSUP', None),
+                getattr(errno, 'EOPNOTSUPP', None),
+                getattr(errno, 'EROFS', None),
+            )
+            if err is not None
+        )
+        if exc.errno not in unsupported:
+            raise
+    finally:
+        try:
+            os.close(dir_fd)
+        except OSError:
+            pass
+
+
 def _atomic_write_text(dest: Path, content: str) -> None:
     """Atomically write UTF-8 text to *dest* via a same-directory temp file.
 
@@ -1945,6 +1978,7 @@ def _atomic_write_text(dest: Path, content: str) -> None:
             except OSError:
                 pass
         raise
+    _fsync_directory(dest.parent)
 
 
 def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:

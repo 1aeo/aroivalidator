@@ -102,6 +102,48 @@ class TestAtomicSaveResults(unittest.TestCase):
             self.assertEqual(dest.read_text(encoding='utf-8'), '{"new": true}')
             self.assertEqual([p.name for p in Path(tmp).iterdir()], ['latest.json'])
 
+    def test_atomic_write_fsyncs_parent_directory_and_closes_fd(self):
+        """Parent directory is synced after replace and its fd is always closed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / 'latest.json'
+            fsync_calls = []
+            real_fsync = os.fsync
+            real_close = os.close
+            closed_fds = []
+
+            def spy_fsync(fd):
+                fsync_calls.append(fd)
+                return real_fsync(fd)
+
+            def spy_close(fd):
+                closed_fds.append(fd)
+                return real_close(fd)
+
+            with patch('aroi_validator.os.fsync', side_effect=spy_fsync), \
+                 patch('aroi_validator.os.close', side_effect=spy_close):
+                _atomic_write_text(dest, '{"ok": true}')
+
+            # At least file fd + parent dir fd were fsynced; dir fd was closed.
+            self.assertGreaterEqual(len(fsync_calls), 2)
+            self.assertIn(fsync_calls[-1], closed_fds)
+
+            # Unsupported directory fsync (EINVAL) is ignored and fd still closes.
+            closed_fds.clear()
+            calls = [0]
+
+            def einval_on_second(fd):
+                calls[0] += 1
+                if calls[0] == 2:
+                    raise OSError(errno.EINVAL, 'Invalid argument')
+                return real_fsync(fd)
+
+            with patch('aroi_validator.os.fsync', side_effect=einval_on_second), \
+                 patch('aroi_validator.os.close', side_effect=spy_close):
+                _atomic_write_text(dest, '{"ok": 2}')
+
+            self.assertEqual(dest.read_text(encoding='utf-8'), '{"ok": 2}')
+            self.assertGreaterEqual(len(closed_fds), 1)
+
     def test_atomic_write_preserves_existing_file_on_write_error(self):
         """A simulated ENOSPC during write cleans up tmp file and keeps target intact."""
         with tempfile.TemporaryDirectory() as tmp:
