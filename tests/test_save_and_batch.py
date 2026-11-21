@@ -103,46 +103,94 @@ class TestAtomicSaveResults(unittest.TestCase):
             self.assertEqual([p.name for p in Path(tmp).iterdir()], ['latest.json'])
 
     def test_atomic_write_fsyncs_parent_directory_and_closes_fd(self):
-        """Parent directory is synced after replace and its fd is always closed."""
+        """Parent directory is synced strictly after replace and its fd is closed."""
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / 'latest.json'
-            fsync_calls = []
+            events = []
+            dir_fds = []
+            real_open = os.open
             real_fsync = os.fsync
+            real_replace = os.replace
             real_close = os.close
-            closed_fds = []
+
+            def spy_open(path, flags, *args, **kwargs):
+                fd = real_open(path, flags, *args, **kwargs)
+                if Path(path) == dest.parent:
+                    dir_fds.append(fd)
+                    events.append(('dir_open', fd))
+                return fd
+
+            def spy_replace(src, dst):
+                events.append(('replace', Path(dst)))
+                return real_replace(src, dst)
 
             def spy_fsync(fd):
-                fsync_calls.append(fd)
+                events.append(('dir_fsync' if fd in dir_fds else 'file_fsync', fd))
                 return real_fsync(fd)
 
             def spy_close(fd):
-                closed_fds.append(fd)
+                if fd in dir_fds:
+                    events.append(('dir_close', fd))
                 return real_close(fd)
 
-            with patch('aroi_validator.os.fsync', side_effect=spy_fsync), \
+            with patch('aroi_validator.os.open', side_effect=spy_open), \
+                 patch('aroi_validator.os.replace', side_effect=spy_replace), \
+                 patch('aroi_validator.os.fsync', side_effect=spy_fsync), \
                  patch('aroi_validator.os.close', side_effect=spy_close):
                 _atomic_write_text(dest, '{"ok": true}')
 
-            # At least file fd + parent dir fd were fsynced; dir fd was closed.
-            self.assertGreaterEqual(len(fsync_calls), 2)
-            self.assertIn(fsync_calls[-1], closed_fds)
+            self.assertEqual(len(dir_fds), 1)
+            dir_fd = dir_fds[0]
+            op_names = [e[0] for e in events]
+            self.assertEqual(
+                op_names,
+                ['file_fsync', 'replace', 'dir_open', 'dir_fsync', 'dir_close'],
+            )
+            self.assertIn(('dir_fsync', dir_fd), events)
+            self.assertIn(('dir_close', dir_fd), events)
 
-            # Unsupported directory fsync (EINVAL) is ignored and fd still closes.
-            closed_fds.clear()
-            calls = [0]
+            # Unsupported directory fsync errnos (EINVAL, ENOSYS) are ignored and fd closes.
+            for err_no in (errno.EINVAL, errno.ENOSYS):
+                events.clear()
+                dir_fds.clear()
 
-            def einval_on_second(fd):
-                calls[0] += 1
-                if calls[0] == 2:
-                    raise OSError(errno.EINVAL, 'Invalid argument')
-                return real_fsync(fd)
+                def unsupported_dir_fsync(fd, _err=err_no):
+                    if fd in dir_fds:
+                        events.append(('dir_fsync', fd))
+                        raise OSError(_err, 'Unsupported')
+                    events.append(('file_fsync', fd))
+                    return real_fsync(fd)
 
-            with patch('aroi_validator.os.fsync', side_effect=einval_on_second), \
-                 patch('aroi_validator.os.close', side_effect=spy_close):
-                _atomic_write_text(dest, '{"ok": 2}')
+                with patch('aroi_validator.os.open', side_effect=spy_open), \
+                     patch('aroi_validator.os.replace', side_effect=spy_replace), \
+                     patch('aroi_validator.os.fsync', side_effect=unsupported_dir_fsync), \
+                     patch('aroi_validator.os.close', side_effect=spy_close):
+                    _atomic_write_text(dest, '{"ok": 2}')
 
-            self.assertEqual(dest.read_text(encoding='utf-8'), '{"ok": 2}')
-            self.assertGreaterEqual(len(closed_fds), 1)
+                self.assertEqual(dest.read_text(encoding='utf-8'), '{"ok": 2}')
+                self.assertEqual([e[0] for e in events], ['file_fsync', 'replace', 'dir_open', 'dir_fsync', 'dir_close'])
+
+    def test_save_results_propagates_operational_error_on_dir_open(self):
+        """Operational os.open errors (e.g. ENOMEM) on parent dir must propagate."""
+        results = [{'nickname': 'Relay1', 'valid': True, 'proof_type': 'dns-rsa', 'ciissversion': '2'}]
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                real_open = os.open
+
+                def enomem_on_dir_open(path, flags, *args, **kwargs):
+                    if Path(path) == Path(tmp, 'validation_results').resolve():
+                        raise OSError(errno.ENOMEM, 'Out of memory')
+                    return real_open(path, flags, *args, **kwargs)
+
+                with patch('aroi_validator.get_code_commit', return_value=None), \
+                     patch('aroi_validator.os.open', side_effect=enomem_on_dir_open):
+                    with self.assertRaises(OSError) as cm:
+                        save_results(results, 'aroi_validation_20261121_090000.json')
+                self.assertEqual(cm.exception.errno, errno.ENOMEM)
+            finally:
+                os.chdir(cwd)
 
     def test_atomic_write_preserves_existing_file_on_write_error(self):
         """A simulated ENOSPC during write cleans up tmp file and keeps target intact."""

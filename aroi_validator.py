@@ -1892,25 +1892,39 @@ def _fsync_directory(directory: Path) -> None:
     if not hasattr(os, 'O_RDONLY'):
         return
     flags = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0)
+    unsupported_open = tuple(
+        err for err in (
+            getattr(errno, 'EINVAL', None),
+            getattr(errno, 'EISDIR', None),
+            getattr(errno, 'ENOTSUP', None),
+            getattr(errno, 'EOPNOTSUPP', None),
+            getattr(errno, 'ENOSYS', None),
+            getattr(errno, 'EACCES', None) if os.name == 'nt' else None,
+        )
+        if err is not None
+    )
     try:
         dir_fd = os.open(directory, flags)
-    except OSError:
-        return
+    except OSError as exc:
+        if exc.errno in unsupported_open:
+            return
+        raise
     try:
         os.fsync(dir_fd)
     except OSError as exc:
-        unsupported = tuple(
+        unsupported_sync = tuple(
             err for err in (
                 getattr(errno, 'EINVAL', None),
                 getattr(errno, 'EBADF', None),
                 getattr(errno, 'EACCES', None),
                 getattr(errno, 'ENOTSUP', None),
                 getattr(errno, 'EOPNOTSUPP', None),
+                getattr(errno, 'ENOSYS', None),
                 getattr(errno, 'EROFS', None),
             )
             if err is not None
         )
-        if exc.errno not in unsupported:
+        if exc.errno not in unsupported_sync:
             raise
     finally:
         try:
