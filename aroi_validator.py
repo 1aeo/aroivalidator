@@ -13,11 +13,12 @@ import json
 import logging
 import os
 import re
+import secrets
 import socket
 import ssl
+import stat
 import string
 import subprocess
-import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1888,27 +1889,48 @@ def get_code_commit() -> Optional[str]:
 def _atomic_write_text(dest: Path, content: str) -> None:
     """Atomically write UTF-8 text to *dest* via a same-directory temp file.
 
-    Flushes and fsyncs the temporary file, ensures 0644 permissions, and
-    replaces *dest* atomically. Cleans up the temporary file on any failure
-    so a full disk or crash cannot leave a truncated or 0-byte target file.
+    For an existing regular destination file, preserves its permission mode
+    (using descriptor-based ``os.fchmod``). For a new file, creates it with
+    ``0o644`` masked by the process umask. Flushes and fsyncs before replacing
+    *dest*, and cleans up the temporary file on any failure.
     """
-    tmp_path: Optional[Path] = None
+    existing_mode: Optional[int] = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode='w',
-            encoding='utf-8',
-            dir=dest.parent,
-            prefix='.aroi-',
-            suffix='.tmp',
-            delete=False,
-        ) as tmp:
-            tmp_path = Path(tmp.name)
+        st = dest.lstat()
+        if stat.S_ISREG(st.st_mode):
+            existing_mode = stat.S_IMODE(st.st_mode)
+    except FileNotFoundError:
+        pass
+
+    tmp_path: Optional[Path] = None
+    fd: Optional[int] = None
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        for _ in range(100):
+            candidate = dest.parent / f'.aroi-{secrets.token_hex(6)}.tmp'
+            try:
+                fd = os.open(candidate, flags, 0o644)
+                tmp_path = candidate
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(f"Could not allocate temporary file in {dest.parent}")
+
+        with os.fdopen(fd, 'w', encoding='utf-8') as tmp:
+            fd = None  # ownership transferred to file wrapper
             tmp.write(content)
             tmp.flush()
             os.fsync(tmp.fileno())
-        os.chmod(tmp_path, 0o644)
+            if existing_mode is not None:
+                os.fchmod(tmp.fileno(), existing_mode)
         os.replace(tmp_path, dest)
     except Exception:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         if tmp_path is not None:
             try:
                 tmp_path.unlink(missing_ok=True)

@@ -23,13 +23,14 @@ class TestAtomicSaveResults(unittest.TestCase):
     """Verify save_results writes atomically and leaves no partial files."""
 
     def test_save_results_permissions_format_and_no_leftover_tmp(self):
-        """save_results writes indented JSON with 0644 mode and no .tmp files."""
+        """save_results writes indented JSON honoring umask with no .tmp files."""
         results = [
             {'nickname': 'Relay1', 'valid': True, 'proof_type': 'dns-rsa', 'ciissversion': '2'},
         ]
         cwd = os.getcwd()
         with tempfile.TemporaryDirectory() as tmp:
             os.chdir(tmp)
+            old_umask = os.umask(0o022)
             try:
                 with patch('aroi_validator.get_code_commit', return_value=None):
                     out_path = save_results(results, 'aroi_validation_20261121_090000.json')
@@ -44,7 +45,7 @@ class TestAtomicSaveResults(unittest.TestCase):
                 self.assertEqual(json.loads(raw)['metadata']['total_relays'], 1)
                 self.assertEqual(raw, latest_path.read_text(encoding='utf-8'))
 
-                # Verify world-readable 0644 mode (not mkstemp default 0600)
+                # Default 0o644 mode when umask is 0o022
                 self.assertEqual(stat.S_IMODE(out_path.stat().st_mode), 0o644)
                 self.assertEqual(stat.S_IMODE(latest_path.stat().st_mode), 0o644)
 
@@ -52,7 +53,27 @@ class TestAtomicSaveResults(unittest.TestCase):
                 entries = sorted(p.name for p in out_path.parent.iterdir())
                 self.assertEqual(entries, ['aroi_validation_20261121_090000.json', 'latest.json'])
             finally:
+                os.umask(old_umask)
                 os.chdir(cwd)
+
+    def test_atomic_write_preserves_existing_mode_and_honors_restrictive_umask(self):
+        """Existing restrictive mode (0600) is preserved; new files honor umask."""
+        with tempfile.TemporaryDirectory() as tmp:
+            dest_existing = Path(tmp) / 'latest.json'
+            dest_existing.write_text('{"old": true}', encoding='utf-8')
+            os.chmod(dest_existing, 0o600)
+
+            old_umask = os.umask(0o022)
+            try:
+                _atomic_write_text(dest_existing, '{"new": true}')
+                self.assertEqual(stat.S_IMODE(dest_existing.stat().st_mode), 0o600)
+
+                os.umask(0o077)
+                dest_new = Path(tmp) / 'restricted.json'
+                _atomic_write_text(dest_new, '{"restricted": true}')
+                self.assertEqual(stat.S_IMODE(dest_new.stat().st_mode), 0o600)
+            finally:
+                os.umask(old_umask)
 
     def test_atomic_write_preserves_existing_file_on_write_error(self):
         """A simulated ENOSPC during write cleans up tmp file and keeps target intact."""
@@ -60,16 +81,18 @@ class TestAtomicSaveResults(unittest.TestCase):
             dest = Path(tmp) / 'latest.json'
             dest.write_text('{"previous": true}', encoding='utf-8')
 
-            fake_tmp = MagicMock()
-            fake_tmp.name = str(Path(tmp) / '.latest.json.fail.tmp')
-            Path(fake_tmp.name).write_text('', encoding='utf-8')
-            fake_tmp.write.side_effect = OSError(errno.ENOSPC, 'No space left on device')
+            real_fdopen = os.fdopen
 
-            cm = MagicMock()
-            cm.__enter__.return_value = fake_tmp
-            cm.__exit__.return_value = False
+            def failing_fdopen(fd, *args, **kwargs):
+                real_f = real_fdopen(fd, *args, **kwargs)
+                real_f.close()
+                fake_cm = MagicMock()
+                fake_cm.__enter__.return_value = fake_cm
+                fake_cm.__exit__.return_value = False
+                fake_cm.write.side_effect = OSError(errno.ENOSPC, 'No space left on device')
+                return fake_cm
 
-            with patch('aroi_validator.tempfile.NamedTemporaryFile', return_value=cm):
+            with patch('aroi_validator.os.fdopen', side_effect=failing_fdopen):
                 with self.assertRaises(OSError):
                     _atomic_write_text(dest, '{"new": true}')
 
