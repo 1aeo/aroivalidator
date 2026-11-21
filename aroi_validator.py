@@ -17,6 +17,7 @@ import socket
 import ssl
 import string
 import subprocess
+import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1884,6 +1885,38 @@ def get_code_commit() -> Optional[str]:
     return head if _FULL_COMMIT_RE.fullmatch(head) else None
 
 
+def _atomic_write_text(dest: Path, content: str) -> None:
+    """Atomically write UTF-8 text to *dest* via a same-directory temp file.
+
+    Flushes and fsyncs the temporary file, ensures 0644 permissions, and
+    replaces *dest* atomically. Cleans up the temporary file on any failure
+    so a full disk or crash cannot leave a truncated or 0-byte target file.
+    """
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode='w',
+            encoding='utf-8',
+            dir=dest.parent,
+            prefix=f'.{dest.name}.',
+            suffix='.tmp',
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(content)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(tmp_path, 0o644)
+        os.replace(tmp_path, dest)
+    except Exception:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
 def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     """Save validation results to JSON file."""
     results_dir = Path('validation_results').resolve()
@@ -1910,8 +1943,10 @@ def save_results(results: List[Dict], filename: Optional[str] = None) -> Path:
     file_path = results_dir / filename
     json_content = json.dumps(output_data, indent=2)
 
-    file_path.write_text(json_content)
-    (results_dir / 'latest.json').write_text(json_content)
+    _atomic_write_text(file_path, json_content)
+    latest_path = results_dir / 'latest.json'
+    if file_path != latest_path:
+        _atomic_write_text(latest_path, json_content)
 
     return file_path
 

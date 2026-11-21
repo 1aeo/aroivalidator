@@ -442,11 +442,25 @@ def _get_validated_env_int(name: str, default: int, min_val: int, max_val: int) 
         return default
 
 
-def batch_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
+def _is_batch_quiet(flag_quiet=None):
+    """Resolve whether batch mode should omit per-relay progress lines.
+
+    Explicit *flag_quiet* overrides the BATCH_QUIET environment variable.
+    """
+    if flag_quiet is not None:
+        return bool(flag_quiet)
+    return os.environ.get('BATCH_QUIET', 'false').strip().lower() in (
+        'true', '1', 'yes', 'on'
+    )
+
+
+def batch_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT, quiet=None):
     """Batch validation mode for automation"""
     from aroi_validator import (
         run_validation, calculate_statistics, save_results, get_code_commit
     )
+
+    is_quiet = _is_batch_quiet(quiet)
 
     print("AROI Batch Validator (Parallel Processing)")
     print("=" * 50)
@@ -467,10 +481,13 @@ def batch_mode(supported_ciissversions=SUPPORTED_CIISSVERSIONS_DEFAULT):
     if use_parallel:
         print(f"Using parallel processing with {max_workers} workers")
 
-    # Progress callback
-    def progress_callback(current, total, result):
-        status = "✓" if result['valid'] else "✗"
-        print(f"[{current}/{total}] {status} {result.get('nickname', 'Unknown')}")
+    # Progress callback (suppressed in quiet mode to avoid log bloat)
+    if is_quiet:
+        progress_callback = None
+    else:
+        def progress_callback(current, total, result):
+            status = "✓" if result['valid'] else "✗"
+            print(f"[{current}/{total}] {status} {result.get('nickname', 'Unknown')}")
 
     # Run validation
     results = run_validation(
@@ -528,10 +545,11 @@ def main():
 
     # Resolve supported ciissversions from --ciiss-versions flag or env var.
     supported_ciissversions = _resolve_ciissversions_from_args(sys.argv)
+    quiet = True if ("--quiet" in sys.argv[1:] or "-q" in sys.argv[1:]) else None
 
     # Route to appropriate mode
     if mode == "batch":
-        batch_mode(supported_ciissversions=supported_ciissversions)
+        batch_mode(supported_ciissversions=supported_ciissversions, quiet=quiet)
     elif mode == "viewer":
         viewer_mode()
     else:
